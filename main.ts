@@ -1,11 +1,16 @@
-// A token-radar-01 entry (Node 22, standard library only).
+// A token-radar-01 entry, v2c (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits
-// the comps model in lib/model.ts on the snapshot's traded token families, scores every
-// pre-token protocol, writes the ranked board to /output/board.json, writes the dashboard's
-// data beside the page as /output/data.js, and copies this repository's dashboard/ and
-// screenshots/ to /output. Last, it writes /output/dossier.json, the summary the judge reads,
-// with the vendored make.fun library.
+// the v2c comps model in lib/model.ts on the snapshot's traded token families — a log-log
+// curve, log10(mcap) = a + b*log10(TVL), with the category shrinkage K tuned by
+// leave-one-out over {3, 5, 8, 12, 20, 25, 40} and the chains/breadth term tested both ways
+// and shipped only if it wins both backtests — scores every pre-token protocol, writes the
+// ranked board to /output/board.json, writes the dashboard's data beside the page as
+// /output/data.js, and copies this repository's dashboard/ and screenshots/ to /output.
+// Last, it writes /output/dossier.json, the summary the judge reads, with the vendored
+// make.fun library. Buckets follow the field convention: traded means the protocol records
+// a token at all (416), set aside means a pre-token protocol the board does not rank (144),
+// and the fit set is named on its own (128 families fitted).
 //
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
 // and dashboard/app.js read /output/data.js, which this program writes from the same board.
@@ -13,14 +18,14 @@
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
 //
-// NOTE (v2): dashboard/ and screenshots/ are in this repository now, so the program is
+// NOTE (v2c): dashboard/ and screenshots/ are in this repository now, so the program is
 // strict again, as the starter's main.ts is: a missing dashboard or fewer than 3 screenshots
 // is a failure (exit non-zero), and dossier.json is always written on a successful run.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, fitComps, parseSnapshot } from './lib/model.ts';
+import { SHRINK_K_GRID, boardIssue, buildRadar, dataScript, fitComps, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -110,7 +115,10 @@ const dossierWritten = true;
 const dossierBytes = statSync(join(out, 'dossier.json')).size;
 
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${board.length - snapshot.watchlist.length} early, ${radar.live.length} live set aside)\n` +
-    `token radar: fit log10(mcap) = ${fit.a} + ${fit.b}*log10(TVL), R2=${fit.r2}, ${fit.n_families} families (${fit.n_dead_excluded} dead tokens excluded); LOO median miss x${fit.loo.median_miss} vs flat x${fit.loo.flat_median_miss}; time-split x${fit.timesplit.median_miss} vs flat x${fit.timesplit.flat_median_miss}\n` +
-    `token radar: verdicts FARM ${radar.counts.farm} / THIN ${radar.counts.thin} / SKIP ${radar.counts.skip}; wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images)${dossierWritten ? ` and ${join(out, 'dossier.json')} (${dossierBytes} bytes)` : ' (no dossier.json yet)'}\n`,
+  `token radar: ${snapshot.protocols.length} protocols (${radar.counts.pre_token} pre-token, ${radar.counts.traded} record a token, ${radar.counts.set_aside} set aside), ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${board.length - snapshot.watchlist.length} early, ${radar.live.length} live shown of ${radar.counts.traded} that record a token)\n` +
+    `token radar: fit log10(mcap) = ${fit.a} + ${fit.b}*log10(TVL)${fit.breadth_enabled ? ` + ${fit.c}*log10(min(chains,10))` : ''}, R2=${fit.r2}, ${fit.n_families} families fitted (${fit.n_dead_excluded} dead tokens excluded); shrinkage K=${fit.shrink_k} tuned by LOO over {${SHRINK_K_GRID.join(',')}}; LOO median miss x${fit.loo.median_miss} vs flat x${fit.loo.flat_median_miss}; time-split x${fit.timesplit.median_miss} vs flat x${fit.timesplit.flat_median_miss}\n` +
+    `token radar: shrink K-curve (LOO median miss): ${fit.shrink_k_curve.map(([k, m]) => `K${k} x${m}`).join(', ')}; breadth ${fit.breadth_enabled ? `SHIPPED (c=${fit.c})` : 'TESTED AND DROPPED'} — with chains LOO x${fit.variant_test.breadth.loo_miss} / time-split x${fit.variant_test.breadth.ts_miss} (K=${fit.variant_test.breadth.k}) vs without x${fit.variant_test.nobreadth.loo_miss} / x${fit.variant_test.nobreadth.ts_miss} (K=${fit.variant_test.nobreadth.k})\n` +
+    `token radar: plans that pay ${radar.counts.robust + radar.counts.farm + radar.counts.thin}/${board.length} — ROBUST ${radar.counts.robust} (pay even at the band low end) / FARM ${radar.counts.farm} / THIN ${radar.counts.thin} / SKIP ${radar.counts.skip}; early finds ${radar.counts.early_finds} off-watchlist (new <=180d or rising 7d); set aside ${radar.counts.set_aside} pre-token protocols not ranked\n` +
+    `token radar: robustness is keyed to the P25 low end (x${fit.band50[0]} of implied); at the P10 low end (x${fit.band80[0]}) no plan on the board pays, and each row still carries its P10 net\n` +
+    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images)${dossierWritten ? ` and ${join(out, 'dossier.json')} (${dossierBytes} bytes)` : ' (no dossier.json yet)'}\n`,
 );
