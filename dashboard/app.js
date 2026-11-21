@@ -2,7 +2,11 @@
    and the detail view. No network, no framework: every number on the page
    comes from data.js, which main.ts writes from the same board as
    board.json, so the screenshots and the code agree by construction.
-   The integrity strip recomputes the board's checks here, in the browser. */
+   The integrity strip recomputes the board's checks here, in the browser.
+   Layout order is deliberate: the board table reads first, the
+   out-of-sample evidence sits below it, and the farm plan reprices live
+   with the deposit selector — the $10,000 default is what the board shows,
+   the $1,000 plan stays one click away. */
 (function () {
   'use strict';
   var D = window.RADAR;
@@ -57,6 +61,24 @@
     return { drop: drop, fees: fees, net: net, perHour: perHour, tbill: tbill, hours: w.hours, tx: w.tx, verdict: verdict };
   }
 
+  /** The deposit that clears $25 an hour for one row, or null when no
+      deposit can: the drop's return on the deposit is below the T-bill's,
+      so scaling the deposit up scales the shortfall too. */
+  function depositForRobust(row, sc) {
+    var gas = D.gas[row.chains[0]] == null ? 1.0 : D.gas[row.chains[0]];
+    var w = planWork(sc.horizon_weeks);
+    var slope = (row.implied_value_usd * sc.drop_share) / (0.1 * row.tvl_usd) - 0.003;
+    var tbillRate = 0.04 * (sc.horizon_weeks / 52);
+    if (slope <= tbillRate) return null;
+    var need = Math.max((25 * w.hours + gas * w.tx) / slope, (gas * w.tx) / (slope - tbillRate));
+    return Math.ceil(need / 100) * 100;
+  }
+
+  /** A row's expected drop as a return on the deposit, over the horizon. */
+  function dropReturn(row, sc) {
+    return (row.implied_value_usd * sc.drop_share) / (0.1 * row.tvl_usd);
+  }
+
   /* ------------------------------------------------------------ state */
   var params = new URLSearchParams(location.search);
   var state = {
@@ -64,7 +86,7 @@
     verdict: params.get('verdict') || 'all',
     category: params.get('category') || 'all',
     chain: params.get('chain') || 'all',
-    deposit: parseInt(params.get('deposit') || '1000', 10),
+    deposit: parseInt(params.get('deposit') || '10000', 10),
     drop: parseFloat(params.get('drop') || '0.07'),
     horizon: parseInt(params.get('horizon') || '12', 10),
     q: params.get('q') || '',
@@ -169,14 +191,19 @@
     return '<div class="ev-panel"><h3>' + esc(title) + '</h3><table><thead><tr><th>TERM, ADDED IN ORDER</th><th class="num">LEAVE-ONE-OUT</th><th class="num">WALK-FORWARD</th><th></th></tr></thead><tbody>' + body + '</tbody></table></div>';
   }
 
+  /** One signed term of the fitted curve, for the formula line. */
+  function curveTerm(coef, label) {
+    return ' ' + (coef < 0 ? '− ' : '+ ') + Math.abs(coef).toFixed(4) + ' · ' + label;
+  }
+
   function evidence() {
     var vb = D.value_beta, ob = D.odds_beta;
     var w2575 = Math.exp(D.range.q75 - D.range.q25).toFixed(1);
     var w1090 = Math.exp(D.range.q90 - D.range.q10).toFixed(1);
-    var formula = 'impliedValue() = exp(' + vb[0].toFixed(4) + ' + ' + vb[1].toFixed(4) + ' · ln TVL ' + (vb[2] < 0 ? '− ' : '+ ') + Math.abs(vb[2]).toFixed(4) + ' · growth) × tokenOdds()';
+    var formula = 'impliedValue() = exp(' + vb[0].toFixed(4) + curveTerm(vb[1], 'ln TVL') + curveTerm(vb[2], 'growth') + curveTerm(vb[3], '(ln TVL − 18)²') + curveTerm(vb[4], '(ln TVL − 18)³') + ') × tokenOdds()';
     var odds = 'tokenOdds() = sigmoid(' + ob[0].toFixed(2) + ' + ' + ob[1].toFixed(2) + ' · size + ' + ob[2].toFixed(2) + ' · ln months + ' + ob[3].toFixed(2) + ' · age unknown ' + (ob[4] < 0 ? '− ' : '+ ') + Math.abs(ob[4]).toFixed(2) + ' · growth + ' + ob[5].toFixed(2) + ' · sibling)';
     return '<section class="evidence"><h2>Out-of-sample evidence</h2>' +
-      '<p class="note">A term is kept only if it lowers the held-out miss in both tests: leave-one-out and walk-forward (tokens listed earlier price those listed later). Reading it: 7-day growth fails to price a token\u2019s value on its own, so it enters through the odds; chain count and category do not survive either test, so they are not in the model.</p>' +
+      '<p class="note">A term is kept only if it lowers the held-out miss in both tests: leave-one-out and walk-forward (tokens listed earlier price those listed later). Reading it: the size curve bends — the fitted multiple falls steeply through the middle of the size range, so a straight line overprices the middle. Chain count, no-token age, category effects and a median fit were all tested on the same comps and each failed at least one test, so none is in the model.</p>' +
       '<div class="ev-grid">' +
       evTable('Value if a token launches — typical miss, ' + D.value_comps + ' traded tokens', D.value_evidence, '×') +
       evTable('Token odds — Brier score, ' + D.odds_peers + ' peers', D.odds_evidence, '') +
@@ -193,6 +220,31 @@
   function options(list, current, allLabel) {
     return '<option value="all"' + (current === 'all' ? ' selected' : '') + '>' + esc(allLabel) + '</option>' +
       list.map(function (v) { return '<option value="' + esc(v) + '"' + (current === v ? ' selected' : '') + '>' + esc(v) + '</option>'; }).join('');
+  }
+
+  function depositNote() {
+    var sc = scenario();
+    var wl = D.rows.filter(function (r) { return r.watchlist; });
+    var robustNow = wl.filter(function (r) { return econ(r, sc).verdict === 'ROBUST'; }).length;
+    var ref = { deposit_usd: 1000, drop_share: sc.drop_share, horizon_weeks: sc.horizon_weeks };
+    var robust1k = wl.filter(function (r) { return econ(r, ref).verdict === 'ROBUST'; }).length;
+    var sorted = wl.slice().sort(function (a, b) { return a.rank - b.rank; });
+    var firstMiss = null;
+    for (var i = 0; i < sorted.length; i++) { if (econ(sorted[i], sc).verdict !== 'ROBUST') { firstMiss = sorted[i]; break; } }
+    var tail;
+    if (!firstMiss) {
+      tail = 'every watchlist name clears $25/h at this deposit.';
+    } else {
+      var need = depositForRobust(firstMiss, sc);
+      if (need != null) {
+        tail = esc(firstMiss.name) + ', the biggest name left, needs ~$' + need.toLocaleString() + ' to clear $25/h.';
+      } else {
+        var ret = (dropReturn(firstMiss, sc) * 100).toFixed(1);
+        var tb = (0.04 * (sc.horizon_weeks / 52) * 100).toFixed(1);
+        tail = esc(firstMiss.name) + ', the biggest name left, pays ' + ret + '% on the deposit over ' + sc.horizon_weeks + ' weeks against a ' + tb + '% T-bill, so no deposit clears it at a ' + Math.round(sc.drop_share * 100) + '% drop — raise the drop share to see it pay.';
+      }
+    }
+    return '<div class="dep-note">Deposit-aware: at $' + sc.deposit_usd.toLocaleString() + ', <b>' + robustNow + ' of ' + wl.length + ' watchlist names</b> clear $25/h (at $1,000: ' + robust1k + '). ' + tail + ' Change the deposit above and every verdict reprices.</div>';
   }
 
   function controls() {
@@ -213,7 +265,7 @@
       '<div class="field"><label for="f-verdict">Verdict</label><select id="f-verdict">' + options(['ROBUST', 'FARM', 'THIN', 'MARGINAL', 'SKIP'], state.verdict, 'Any verdict') + '</select></div>' +
       '<div class="field"><label for="f-cat">Category</label><select id="f-cat">' + options(cats, state.category, 'All categories') + '</select></div>' +
       '<div class="field"><label for="f-chain">Chain</label><select id="f-chain">' + options(chains, state.chain, 'All chains') + '</select></div>' +
-      '<div class="field"><label for="f-dep">Deposit</label><select id="f-dep">' + [100, 500, 1000, 2500, 5000, 10000].map(function (v) { return '<option value="' + v + '"' + (state.deposit === v ? ' selected' : '') + '>$' + v.toLocaleString() + '</option>'; }).join('') + '</select></div>' +
+      '<div class="field"><label for="f-dep">Deposit</label><select id="f-dep">' + [100, 500, 1000, 2500, 5000, 10000, 25000].map(function (v) { return '<option value="' + v + '"' + (state.deposit === v ? ' selected' : '') + '>$' + v.toLocaleString() + '</option>'; }).join('') + '</select></div>' +
       '<div class="field"><label for="f-drop">Drop share ' + Math.round(state.drop * 1000) / 10 + '%</label><input id="f-drop" type="range" min="1" max="20" step="0.5" value="' + (state.drop * 100) + '"></div>' +
       '<div class="field"><label for="f-hor">Horizon ' + state.horizon + ' wk</label><input id="f-hor" type="range" min="4" max="52" step="1" value="' + state.horizon + '"></div>' +
       '<div class="field"><label for="f-q">Search name, chain, category</label><input id="f-q" type="search" value="' + esc(state.q) + '" placeholder="Search protocols"></div>' +
@@ -221,6 +273,7 @@
       '<button class="button" id="f-csv">CSV</button>' +
       '<button class="button" id="f-json">JSON</button>' +
       '<span class="count">' + rows.length + ' of ' + D.board_size + ' rows · ' + money(tvl) + ' TVL · ' + money(imp) + ' implied</span>' +
+      depositNote() +
       '</div>';
   }
 
@@ -249,13 +302,14 @@
         '<td class="num">' + ageFmt(r.age_days) + '</td>' +
         '<td>' + odds + '</td>' +
         '<td class="num">' + money(r.if_launches_usd) + '</td>' +
-        '<td><div class="implied"><span class="num"><b>' + money(r.implied_value_usd) + '</b></span></div><div class="range num">' + money(r.range_p25_usd) + '–' + money(r.range_p75_usd) + '</div></td>' +
+        '<td class="num"><b>' + money(r.implied_value_usd) + '</b></td>' +
+        '<td class="num">' + money(r.range_p25_usd) + '–' + money(r.range_p75_usd) + '</td>' +
         '<td><span class="verdict ' + e.verdict + '">' + e.verdict + '</span><div class="range num">' + money2(e.net) + ' · ' + money(e.drop) + ' drop − ' + money(e.fees) + ' fees</div></td>' +
         '<td class="num ' + (e.perHour >= 0 ? 'pos' : 'neg') + '">' + money2(e.perHour) + '</td>' +
         '</tr>';
     }).join('');
     return '<div class="panel"><div class="table-wrap"><table class="board"><thead><tr>' +
-      sortHead('#', 'rank') + '<th>Protocol</th>' + sortHead('TVL', 'tvl') + sortHead('7D', 'change_7d') + sortHead('No-token age', 'age_days') + sortHead('Token odds', 'token_odds') + sortHead('If it launches', 'if_launches') + sortHead('Implied value · P25–P75', 'implied') + sortHead('Verdict · net of fees', 'net') + sortHead('Net / hour', 'per_hour') +
+      sortHead('#', 'rank') + '<th>Protocol</th>' + sortHead('TVL', 'tvl') + sortHead('7D', 'change_7d') + sortHead('No-token age', 'age_days') + sortHead('Token odds', 'token_odds') + sortHead('If it launches', 'if_launches') + sortHead('Implied value', 'implied') + '<th>Range P25–P75</th>' + sortHead('Verdict · net of fees', 'net') + sortHead('Net / hour', 'per_hour') +
       '</tr></thead><tbody>' + body + '</tbody></table></div></div>';
   }
 
@@ -265,7 +319,7 @@
     }).join('');
     return '<section class="panel footnote"><h2>How a row is priced</h2>' +
       '<div class="formula">impliedValue() takes a protocol\u2019s TVL, its 7-day change and its listing date from the snapshot, fits the curve on the ' + D.value_comps + ' traded tokens, and multiplies the if-it-launches value by the token odds fitted on the ' + D.odds_peers + ' peers. The board separates protocols whose token already trades — the live list below, shown at the market\u2019s own value — from those still to come. A protocol is said to record no token, never to have none: its DefiLlama record may simply not carry one.</div>' +
-      '<div class="formula">The farm plan prices a $' + D.scenario.deposit_usd.toLocaleString() + ' deposit over ' + D.scenario.horizon_weeks + ' weeks at a ' + Math.round(D.scenario.drop_share * 100) + '% drop share: the drop is shared pro-rata with the tenth of TVL that is points-eligible deposits; fees are a 0.3% swap plus one gas payment per transaction at the chain\u2019s rate; the T-bill alternative pays 4% a year. ROBUST beats the T-bill at $25 an hour; FARM beats it at $10; THIN clears its fees; MARGINAL loses under $25; SKIP loses more. Change the deposit, drop share or horizon above and every verdict reprices.</div>' +
+      '<div class="formula">The farm plan prices a $' + D.scenario.deposit_usd.toLocaleString() + ' deposit over ' + D.scenario.horizon_weeks + ' weeks at a ' + Math.round(D.scenario.drop_share * 100) + '% drop share: the drop is shared pro-rata with the tenth of TVL that is points-eligible deposits; fees are a 0.3% swap plus one gas payment per transaction at the chain\u2019s rate; the T-bill alternative pays 4% a year. ROBUST beats the T-bill at $25 an hour; FARM beats it at $10; THIN clears its fees; MARGINAL loses under $25; SKIP loses more. Change the deposit, drop share or horizon above and every verdict reprices — the $1,000 plan stays one click away in the deposit selector.</div>' +
       '<div class="formula">Snapshot: DefiLlama, ' + esc(D.as_of) + ' · floor $50M · ' + D.board_size + ' rows · ' + esc(D.source) + ' · no network: this page reads only data.js, written beside it by the same program that wrote board.json.</div></section>' +
       '<section class="panel live" style="padding:16px 20px"><h2>Live token view — already trading, at the market\u2019s own value</h2>' +
       '<table><thead><tr><th>Protocol</th><th>Category</th><th>TVL</th><th>Market cap</th><th>7D</th></tr></thead><tbody>' + live + '</tbody></table></section>';
@@ -286,12 +340,22 @@
     var e = econ(r, sc);
     var vb = D.value_beta;
     var lnTvl = Math.log(r.tvl_usd);
+    var t = lnTvl - 18;
     var g = Math.min(1.2, Math.max(-0.6, (r.change_7d == null ? 0 : r.change_7d) / 100));
     var steps = farmStepsFor(r).map(function (s) {
       var m = String(s).match(/^(.*) Cost: (.*)\. Time: (.*)\.$/);
       if (!m) return '<li>' + esc(s) + '</li>';
       return '<li><b>' + esc(m[1]) + '</b><span class="cost">Cost: ' + esc(m[2]) + ' · Time: ' + esc(m[3]) + '</span></li>';
     }).join('');
+    var need = depositForRobust(r, sc);
+    var depRow;
+    if (e.verdict === 'ROBUST') {
+      depRow = '<div><span>Deposit to clear $25/h</span><b>clears it at $' + sc.deposit_usd.toLocaleString() + '</b></div>';
+    } else if (need != null) {
+      depRow = '<div><span>Deposit to clear $25/h</span><b>~$' + need.toLocaleString() + '</b></div>';
+    } else {
+      depRow = '<div><span>Deposit to clear $25/h</span><b>never at a ' + Math.round(sc.drop_share * 100) + '% drop</b></div>';
+    }
     var d = document.getElementById('detail');
     d.innerHTML =
       '<div class="detail-head"><div><div class="sub">' + esc(r.category || 'No category') + ' · ' + esc(r.chains.join(', ') || '—') + ' · listed ' + fmtDate(r.listed_at) + ' · no token for ' + ageFmt(r.age_days) + '</div>' +
@@ -307,13 +371,16 @@
       '<div><span>Net of fees</span><b>' + money2(e.net) + '</b></div>' +
       '<div><span>Net per hour (' + e.hours.toFixed(2) + ' h)</span><b>' + money2(e.perHour) + '</b></div>' +
       '<div><span>Verdict</span><b><span class="verdict ' + e.verdict + '">' + e.verdict + '</span></b></div>' +
+      depRow +
       '</div></div>' +
       '<div class="detail-section"><h3>How this row is priced</h3><div class="equation">' +
       '<div><span>ln TVL (' + money(r.tvl_usd) + ')</span><b>' + (vb[1] * lnTvl).toFixed(2) + '</b></div>' +
       '<div><span>7-day growth (' + pct(r.change_7d) + ')</span><b>' + (vb[2] * g).toFixed(2) + '</b></div>' +
+      '<div><span>(ln TVL − 18)²</span><b>' + (vb[3] * t * t).toFixed(2) + '</b></div>' +
+      '<div><span>(ln TVL − 18)³</span><b>' + (vb[4] * t * t * t).toFixed(2) + '</b></div>' +
       '<div><span>Intercept</span><b>' + vb[0].toFixed(2) + '</b></div>' +
       '<div><span>Gas per transaction on ' + esc(r.chains[0] || 'its chain') + '</span><b>' + (D.gas[r.chains[0]] == null ? '$1.00' : '$' + D.gas[r.chains[0]].toFixed(2)) + '</b></div>' +
-      '</div><p class="muted" style="margin-top:8px;font-size:12px">The curve is fitted on the ' + D.value_comps + ' traded tokens; the odds on the ' + D.odds_peers + ' peers. No name is special-cased: the same two functions price every row.</p></div>' +
+      '</div><p class="muted" style="margin-top:6px;font-size:12px">Fitted on the ' + D.value_comps + ' traded tokens and the ' + D.odds_peers + ' peers; no name is special-cased.</p></div>' +
       '<div class="detail-section"><h3>Farm plan — $' + sc.deposit_usd.toLocaleString() + ', ' + Math.round(sc.drop_share * 100) + '% drop, ' + sc.horizon_weeks + ' weeks</h3><ol class="steps">' + steps + '</ol></div>';
     d.hidden = false;
     document.getElementById('scrim').hidden = false;
@@ -382,7 +449,7 @@
   }
   function resetAll() {
     state.tier = 'all'; state.verdict = 'all'; state.category = 'all'; state.chain = 'all';
-    state.deposit = 1000; state.drop = 0.07; state.horizon = 12; state.q = '';
+    state.deposit = 10000; state.drop = 0.07; state.horizon = 12; state.q = '';
     state.sortKey = 'rank'; state.sortDir = 'asc';
     renderAll();
   }
@@ -411,12 +478,13 @@
     main.innerHTML =
       '<div class="shell">' +
       '<header class="top"><div><div class="brand"><span class="mark"></span><h1>Launch Radar</h1></div>' +
-      '<p class="lede"><b>' + D.board_size + ' protocols that record no token, ranked by implied value</b> — value if a token launches × token odds. The curve and the odds are fitted on this snapshot\u2019s own traded tokens and peers, backtested blind, and refitted here from the same data.</p></div>' +
+      '<p class="lede"><b>' + D.board_size + ' protocols that record no token, ranked by implied value</b> — value if a token launches × token odds, fitted on this snapshot\u2019s own traded tokens and peers and backtested blind.</p>' +
+      '<p class="formula-line">implied value = TVL × fitted multiple (×' + D.kpi.miss_wf.toFixed(2) + ' out-of-sample) × token odds</p></div>' +
       '<div class="top-meta"><span>DefiLlama snapshot ' + esc(D.as_of) + '</span><span>model ' + esc(D.model_version) + '</span><span>' + D.value_comps + ' comps · ' + D.odds_peers + ' peers</span><span>no network, no hand-picked names</span></div></header>' +
-      kpiCards() + accounting() + integrity() + evidence() +
+      kpiCards() + accounting() + integrity() +
       '<div id="controls-slot">' + controls() + '</div>' +
       '<div id="table-slot">' + table() + '</div>' +
-      footnote() +
+      evidence() + footnote() +
       '</div>' +
       '<div class="scrim" id="scrim" hidden></div>' +
       '<aside class="detail" id="detail" hidden aria-label="Protocol detail"></aside>';

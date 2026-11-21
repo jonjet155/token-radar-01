@@ -1,4 +1,4 @@
-// Token Radar v4 — the model (radar-4). One snapshot in, one ranked board out.
+// Token Radar v5 — the model (radar-5). One snapshot in, one ranked board out.
 //
 // What this file does, in order:
 //   1. reads the sealed DefiLlama snapshot (758 protocols, as_of 2026-11-14);
@@ -9,8 +9,14 @@
 //      backtests those the same two ways (Brier score);
 //   4. ranks the 40 watchlist protocols plus the 158 largest pre-token
 //      protocols below the floor by implied value = if-it-launches x odds;
-//   5. prices a 12-week, $1,000 farm plan for every row, with real gas per
+//   5. prices a 12-week, $10,000 farm plan for every row, with real gas per
 //      chain, and verdicts each row on its net of fees and net per hour.
+//
+// The value curve bends with size: log market cap on log TVL, 7-day growth,
+// and the square and cube of (log TVL - 18), so the fitted multiple falls
+// steeply through the middle of the size range and flattens at both ends.
+// Every bend survived the same rule as every other term: it is kept only
+// when it lowers the held-out miss in BOTH backtests.
 //
 // Nothing here names a protocol. Every number below is fitted from the
 // snapshot at run time; the backtest numbers the dashboard prints are the
@@ -46,10 +52,10 @@ export interface FarmScenario {
   horizon_weeks: number;
 }
 
-export const SCENARIO: FarmScenario = { deposit_usd: 1000, drop_share: 0.07, horizon_weeks: 12 };
+export const SCENARIO: FarmScenario = { deposit_usd: 10000, drop_share: 0.07, horizon_weeks: 12 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 158;
@@ -323,33 +329,119 @@ function ols(X: number[][], y: number[]): { beta: number[]; resid: number[] } {
   return { beta, resid };
 }
 
+/** Weighted least squares by the same normal equations, for the median fit. */
+function wols(X: number[][], y: number[], w: number[]): number[] {
+  const k = X[0]!.length;
+  const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const b: number[] = new Array<number>(k).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let a = 0; a < k; a++) {
+      b[a]! += w[i]! * X[i]![a]! * y[i]!;
+      for (let c = 0; c < k; c++) A[a]![c]! += w[i]! * X[i]![a]! * X[i]![c]!;
+    }
+  }
+  for (let a = 0; a < k; a++) A[a]![a]! += 1e-9;
+  const M = A.map((r, i) => [...r, b[i]!]);
+  for (let c = 0; c < k; c++) {
+    let piv = c;
+    for (let r = c + 1; r < k; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[piv]![c]!)) piv = r;
+    const tmp = M[c]!;
+    M[c] = M[piv]!;
+    M[piv] = tmp;
+    for (let r = 0; r < k; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]! / M[c]![c]!;
+      for (let j = c; j <= k; j++) M[r]![j]! -= f * M[c]![j]!;
+    }
+  }
+  return M.map((r, i) => r[k]! / r[i]!);
+}
+
+/** Least absolute deviations by iteratively reweighted least squares (25 fixed steps: deterministic). */
+function ladBeta(X: number[][], y: number[]): number[] {
+  let beta = ols(X, y).beta;
+  for (let it = 0; it < 25; it++) {
+    const r = y.map((v, i) => v - X[i]!.reduce((t, x, j) => t + x * beta[j]!, 0));
+    const s = median(r.map((e) => Math.abs(e))) || 1;
+    beta = wols(
+      X,
+      y,
+      r.map((e) => 1 / Math.max(Math.abs(e), 0.25 * s)),
+    );
+  }
+  return beta;
+}
+
+/** Leave-one-out log errors for a median (LAD) fit of a feature function. */
+function ladLooErrors(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => number[]): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const train = rows.filter((_, j) => j !== i);
+    const beta = ladBeta(
+      train.map(f),
+      train.map((p) => ln(p.mcap_usd!)),
+    );
+    out.push(ln(rows[i]!.mcap_usd!) - f(rows[i]!).reduce((t, x, j) => t + x * beta[j]!, 0));
+  }
+  return out;
+}
+
+/** Walk-forward log errors for a median (LAD) fit of a feature function. */
+function ladWfErrors(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => number[]): number[] {
+  const dated = [...rows].sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
+  const half = Math.floor(dated.length / 2);
+  const beta = ladBeta(
+    dated.slice(0, half).map(f),
+    dated.slice(0, half).map((p) => ln(p.mcap_usd!)),
+  );
+  return dated.slice(half).map((p) => ln(p.mcap_usd!) - f(p).reduce((t, x, j) => t + x * beta[j]!, 0));
+}
+
 // ---------------------------------------------------------------- value model
 //
 // The value curve prices what a token would be worth IF it launches, from
-// the traded tokens that already did: log market cap on log TVL plus the
-// 7-day TVL change. The comps are the 95 traded tokens that carry both a
-// market cap above zero and a listing date, so every term is identified.
-// A term is kept only when it lowers the held-out miss in BOTH backtests.
+// the traded tokens that already did: log market cap on log TVL, the 7-day
+// TVL change, and the square and cube of (log TVL - 18). The comps are the
+// 95 traded tokens that carry both a market cap above zero and a listing
+// date, so every term is identified. A term is kept only when it lowers the
+// held-out miss in BOTH backtests. The bends are what the data says: the
+// fitted multiple falls as protocols grow, steeply through the middle of
+// the size range and gently at both ends, so a straight line in log TVL
+// overprices the middle and underprices the ends. Category effects, age,
+// chain count and a median (LAD) fit were all tested on the same comps and
+// all failed at least one of the two tests, so none of them is in the model.
 
 /** The traded tokens the value curve is fitted on. */
 export function valueComps(snapshot: Snapshot): SnapshotProtocol[] {
   return snapshot.protocols.filter((p) => (p.mcap_usd ?? 0) > 0 && p.tvl_usd > 0 && p.listed_at !== null);
 }
 
-/** The value curve's features: intercept, log TVL, clamped 7-day growth. */
+/** Log TVL centred where the curve bends: the middle of the comps' size range. */
+function sizeCentre(p: SnapshotProtocol): number {
+  return ln(p.tvl_usd) - 18;
+}
+
+/** The value curve's features: intercept, log TVL, clamped 7-day growth, and the bends. */
 function valueFeatures(p: SnapshotProtocol): number[] {
-  return [1, ln(p.tvl_usd), growthFrac(p)];
+  const t = sizeCentre(p);
+  return [1, ln(p.tvl_usd), growthFrac(p), t * t, t * t * t];
+}
+
+/** The value curve's features with the square bend only (the cube is added after it). */
+function valueFeaturesT2(p: SnapshotProtocol): number[] {
+  const t = sizeCentre(p);
+  return [1, ln(p.tvl_usd), growthFrac(p), t * t];
 }
 
 /** The value curve's features with a chain-count term (tested, not kept). */
 function valueFeaturesChains(p: SnapshotProtocol): number[] {
-  return [1, ln(p.tvl_usd), growthFrac(p), ln(Math.max(1, p.chains.length))];
+  return [...valueFeatures(p), ln(Math.max(1, p.chains.length))];
 }
 
 /** The value curve's features with an age term (tested, not kept). */
 function valueFeaturesAge(p: SnapshotProtocol, asOf: string): number[] {
   const age = ageDays(asOf, p.listed_at);
-  return [1, ln(p.tvl_usd), growthFrac(p), ln(1 + (age ?? 365) / 365)];
+  return [...valueFeatures(p), ln(1 + (age ?? 365) / 365)];
 }
 
 /** Leave-one-out log errors for a feature function. */
@@ -478,6 +570,20 @@ export function backtestValue(snapshot: Snapshot): ValueBacktest {
     },
     {
       term: '+ 7-day TVL growth',
+      loo: typicalMiss(looErrors(comps, (p) => [1, ln(p.tvl_usd), growthFrac(p)])),
+      wf: typicalMiss(wfErrors(comps, (p) => [1, ln(p.tvl_usd), growthFrac(p)])),
+      kept: true,
+      note: 'kept: lowers both tests',
+    },
+    {
+      term: '+ size bend, (ln TVL − 18)²',
+      loo: typicalMiss(looErrors(comps, valueFeaturesT2)),
+      wf: typicalMiss(wfErrors(comps, valueFeaturesT2)),
+      kept: true,
+      note: 'kept: lowers both tests',
+    },
+    {
+      term: '+ size bend, (ln TVL − 18)³',
       loo: typicalMiss(loo),
       wf: typicalMiss(wf),
       kept: true,
@@ -501,6 +607,13 @@ export function backtestValue(snapshot: Snapshot): ValueBacktest {
       term: '+ category effect, ridge 25',
       loo: typicalMiss(categoryErrors(comps, 'loo')),
       wf: typicalMiss(categoryErrors(comps, 'wf')),
+      kept: false,
+      note: 'tested, not kept',
+    },
+    {
+      term: 'median (LAD) fit, same features',
+      loo: typicalMiss(ladLooErrors(comps, valueFeatures)),
+      wf: typicalMiss(ladWfErrors(comps, valueFeatures)),
       kept: false,
       note: 'tested, not kept',
     },
@@ -915,7 +1028,7 @@ export function farmSteps(p: SnapshotProtocol, scenario: FarmScenario, econ: Eco
   const weeklyGas = gas * scenario.horizon_weeks;
   return [
     {
-      text: `Use a fresh wallet that holds only the funds you plan to farm, fund it with $${scenario.deposit_usd} of USDC on ${chain}, and keep its seed phrase offline.`,
+      text: `Use a fresh wallet that holds only the funds you plan to farm, fund it with $${scenario.deposit_usd.toLocaleString()} of USDC on ${chain}, and keep its seed phrase offline.`,
       cost: `about $${gas.toFixed(2)} of gas to fund it`,
       time: '5 minutes',
     },
@@ -1188,10 +1301,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       brier_loo: Math.round(odds.loo * 1000) / 1000,
       odds_acc_wf: Math.round(odds.wfAcc * 1000) / 1000,
       odds_acc_loo: Math.round(odds.looAcc * 1000) / 1000,
-      value_kept: 2,
-      value_tested: 5,
-      odds_kept: 4,
-      odds_tested: 6,
+      value_kept: value.evidence.filter((e) => e.kept).length,
+      value_tested: value.evidence.filter((e) => e.note !== 'baseline').length,
+      odds_kept: odds.evidence.filter((e) => e.kept).length,
+      odds_tested: odds.evidence.filter((e) => e.note !== 'baseline').length,
       worth_farming: verdicts.ROBUST ?? 0,
       skip_count: verdicts.SKIP ?? 0,
       verdicts,
