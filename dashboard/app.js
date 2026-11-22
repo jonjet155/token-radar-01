@@ -212,11 +212,11 @@ function integrity() {
 }
 
 function evTable(title, rows, unit) {
-  var html = '<div class="ev-panel"><h3>' + esc(title) + '</h3><table><thead><tr><th>TERM</th><th>ADDED IN ORDER</th><th class="num">LEAVE-ONE-OUT</th><th class="num">WALK-FORWARD</th><th></th></tr></thead><tbody>';
+  var html = '<div class="ev-panel"><h3>' + esc(title) + '</h3><table><thead><tr><th>TERM</th><th>STATUS</th><th class="num">LOO</th><th class="num">WF</th></tr></thead><tbody>';
   rows.forEach(function (r) {
     var loo = unit === '×' ? '×' + r.loo.toFixed(2) : r.loo.toFixed(3);
     var wf = unit === '×' ? '×' + r.wf.toFixed(2) : r.wf.toFixed(3);
-    html += '<tr><td>' + esc(r.term) + '</td><td>' + (r.kept ? '<span class="kept">kept</span>' : '<span class="notkept">tested, not kept</span>') + '</td><td class="num">' + loo + '</td><td class="num">' + wf + '</td><td class="num">' + esc(r.note) + '</td></tr>';
+    html += '<tr><td>' + esc(r.term) + '</td><td>' + (r.kept ? '<span class="kept">kept</span>' : '<span class="notkept">' + (r.note === 'baseline' ? 'baseline' : 'not kept') + '</span>') + '</td><td class="num">' + loo + '</td><td class="num">' + wf + '</td></tr>';
   });
   return html + '</tbody></table></div>';
 }
@@ -225,13 +225,21 @@ function curveTerm(coef, label) {
   return ' ' + (coef < 0 ? '− ' : '+ ') + Math.abs(coef).toFixed(4) + ' · ' + label;
 }
 
+function looRangeSe() {
+  var rg = D.range;
+  // Implied log-SE from the width of the LOO distribution: the IQR of the
+  // leave-one-out misses read as a normal sigma (IQR / 1.349), with the
+  // x1.2 print widening removed. No bootstrap, no resampling.
+  return (rg.q75 - rg.q25) / rg.widen / 1.349;
+}
+
 function evidence() {
   var rg = D.range;
   var w2575 = Math.exp(rg.q75 - rg.q25).toFixed(1);
   var w1090 = Math.exp(rg.q90 - rg.q10).toFixed(1);
-  var b = D.value_beta, o = D.odds_beta;
+  var se = looRangeSe();
   var html = '<section class="evidence"><h2>Out-of-sample evidence</h2>'
-    + '<p class="note">A term is kept only if it lowers the held-out miss in both tests: leave-one-out and walk-forward (tokens listed earlier price those listed later). Reading it: the size curve bends — the fitted multiple falls steeply through the middle of the size range, so a straight line overprices the middle. Chain count, no-token age and a median fit were all tested on the same comps and each failed at least one test, so none is in the model. The category effect survives only on winsorized comps, shrunk with ridge 50: winsorizing alone helps walk-forward and hurts leave-one-out, the premium alone does the reverse, and only the pair lowers both.</p>'
+    + '<p class="note">A term is kept only if it lowers the held-out miss in both tests: leave-one-out and walk-forward. Chain count, no-token age and a median fit each failed at least one test, so none is in the model; the category effect survives only on winsorized comps, shrunk with ridge 50.</p>'
     + '<div class="ev-grid">'
     + evTable('Value if a token launches — typical miss, ' + D.value_comps + ' traded tokens', D.value_evidence, '×')
     + evTable('Token odds — Brier score, ' + D.odds_peers + ' peers', D.odds_evidence, '')
@@ -239,12 +247,9 @@ function evidence() {
     + '<tr><td>Within ×3</td><td class="num">' + rg.within3_loo + '%</td><td class="num">' + rg.within3_wf + '%</td></tr>'
     + '<tr><td>Inside P25–P75 stated 50%</td><td class="num">' + rg.p2575_loo + '%</td><td class="num">' + rg.p2575_wf + '%</td></tr>'
     + '<tr><td>Inside P10–P90 stated 80%</td><td class="num">' + rg.p1090_loo + '%</td><td class="num">' + rg.p1090_wf + '%</td></tr>'
-    + '</tbody></table><div class="formula">Range: the printed P25–P75 is the 25th–75th percentile of the leave-one-out misses, widened ×' + rg.widen + ', ×' + w2575 + ' wide; P10–P90 ×' + w1090 + ' wide, as fitted.</div></div>'
+    + '<tr><td>Implied log-SE, LOO range</td><td class="num">' + se.toFixed(2) + '</td><td class="num">—</td></tr>'
+    + '</tbody></table><div class="formula">Range: the printed P25–P75 is the 25th–75th percentile of the LOO misses, widened ×' + rg.widen + ', ×' + w2575 + ' wide; P10–P90 ×' + w1090 + ' wide. LOO-range-implied SE σ ≈ ' + se.toFixed(2) + ' in log value (≈ ×' + Math.exp(se).toFixed(1) + '): IQR ÷ 1.349, widening removed — no bootstrap.</div></div>'
     + '</div>'
-    + '<div class="formula" style="margin-top:12px"><b>How a row is priced — impliedValue() + backtest()</b><br>'
-    + 'impliedValue() = exp(' + b[0].toFixed(4) + curveTerm(b[1], 'ln TVL') + curveTerm(b[2], 'growth') + curveTerm(b[3], '(ln TVL − 18)²') + curveTerm(b[4], '(ln TVL − 18)³') + ') × categoryEffect() × tokenOdds()<br>'
-    + 'tokenOdds() = sigmoid(' + o[0].toFixed(2) + ' + ' + o[1].toFixed(2) + ' · size + ' + o[2].toFixed(2) + ' · ln months + ' + o[3].toFixed(2) + ' · age unknown ' + (o[4] < 0 ? '− ' : '+ ') + Math.abs(o[4]).toFixed(2) + ' · growth + ' + o[5].toFixed(2) + ' · sibling)<br>'
-    + 'R² ' + D.value_r2.toFixed(3) + ' on ' + D.value_comps + ' comps · category effects ×' + D.value_cat_min + ' to ×' + D.value_cat_max + ' (shrunk, ridge 50; comps winsorized 5–95%) · base token rate ' + (D.odds_base_rate * 100) + '% of ' + D.odds_peers + ' peers · model ' + esc(D.model_version) + ', refitted in this browser from the same data.</div>'
     + '</section>';
   return html;
 }
@@ -317,6 +322,20 @@ function controls() {
   return html;
 }
 
+var SORT_LABELS = { rank: '#', tvl: 'TVL', change_7d: '7D', age_days: 'No-token age', token_odds: 'Token odds', if_launches: 'If it launches', implied: 'Implied value', net: 'Verdict · net', per_hour: 'Net / hour' };
+
+function controlStrip() {
+  var sc = scenario();
+  var tierLabel = state.tier === 'watchlist' ? 'Watchlist ' + D.watchlist_size : state.tier === 'early' ? 'Early ' + D.early_size : 'All ' + D.board_size;
+  var verdictLabel = state.verdict === 'all' ? 'Any' : state.verdict;
+  var sortLabel = (SORT_LABELS[state.sortKey] || 'Implied value') + (state.sortDir === 'asc' ? ' ↑' : ' ↓');
+  return '<div class="strip"><span>Sort: <b>' + esc(sortLabel) + '</b></span>'
+    + '<span>Tier: <b>' + esc(tierLabel) + '</b></span>'
+    + '<span>Verdict: <b>' + esc(verdictLabel) + '</b></span>'
+    + '<span>Deposit: <b>$' + sc.deposit_usd.toLocaleString() + ' · ' + (Math.round(sc.drop_share * 1000) / 10) + '% drop · ' + sc.horizon_weeks + ' wk</b></span>'
+    + '<span class="strip-right"><button type="button" class="button" id="f-csv2">CSV</button><button type="button" class="button" id="f-json2">JSON</button></span></div>';
+}
+
 function sortHead(label, key) {
   var arrow = '';
   if (state.sortKey === key) arrow = state.sortDir === 'asc' ? ' ↑' : ' ↓';
@@ -327,9 +346,9 @@ function table() {
   var sc = scenario();
   var rows = filteredRows();
   if (rows.length === 0) {
-    return '<div class="panel"><div class="empty"><h3>No rows match</h3><p>Loosen a filter or clear the search.</p><button type="button" class="button" id="f-reset2">Reset filters</button></div></div>';
+    return controlStrip() + '<div class="panel"><div class="empty"><h3>No rows match</h3><p>Loosen a filter or clear the search.</p><button type="button" class="button" id="f-reset2">Reset filters</button></div></div>';
   }
-  var html = '<div class="panel"><div class="table-wrap"><table class="board"><thead><tr>'
+  var html = controlStrip() + '<div class="panel"><div class="table-wrap"><table class="board"><thead><tr>'
     + sortHead('#', 'rank') + '<th>Protocol</th>' + sortHead('TVL', 'tvl') + sortHead('7D', 'change_7d')
     + sortHead('No-token age', 'age_days') + sortHead('Token odds', 'token_odds') + sortHead('If it launches', 'if_launches')
     + sortHead('Implied value', 'implied') + '<th>Range P25–P75</th>' + sortHead('Verdict · net of fees', 'net') + sortHead('Net / hour', 'per_hour')
@@ -347,7 +366,7 @@ function table() {
       + '<td class="num">' + Math.round(r.token_odds * 100) + '% <span class="oddsbar"><i style="width:' + (r.token_odds * 100) + '%"></i></span></td>'
       + '<td class="num">' + money(r.if_launches_usd) + '</td>'
       + '<td class="num"><b>' + money(r.implied_value_usd) + '</b></td>'
-      + '<td class="num range">' + money(r.range_p25_usd) + '–' + money(r.range_p75_usd) + '</td>'
+      + '<td class="num">' + money(r.range_p25_usd) + '–' + money(r.range_p75_usd) + '<div class="range">×' + (r.range_p75_usd / r.range_p25_usd).toFixed(1) + ' wide</div></td>'
       + '<td><span class="verdict ' + e.verdict + '">' + e.verdict + '</span><div class="range">' + money2(e.net) + ' · ' + money(e.drop) + ' drop − ' + money(e.fees) + ' fees</div></td>'
       + '<td class="num"><span class="' + (e.perHour >= 0 ? 'pos' : 'neg') + '">' + money2(e.perHour) + '</span></td>'
       + '</tr>';
@@ -360,10 +379,14 @@ function table() {
 
 function footnote() {
   var sc = scenario();
+  var b = D.value_beta, o = D.odds_beta;
   var html = '<section class="panel footnote"><h2>How a row is priced</h2>'
     + '<div class="formula">impliedValue() takes a protocol’s TVL, its 7-day change and its listing date from the snapshot, fits the curve on the ' + D.value_comps + ' traded tokens, and multiplies the if-it-launches value by the token odds fitted on the ' + D.odds_peers + ' peers. The board separates protocols whose token already trades — the live list below, shown at the market’s own value — from those still to come. A protocol is said to record no token, never to have none: its DefiLlama record may simply not carry one.</div>'
     + '<div class="formula">The farm plan prices a $' + sc.deposit_usd.toLocaleString() + ' deposit over ' + sc.horizon_weeks + ' weeks at a ' + (Math.round(sc.drop_share * 1000) / 10) + '% drop share: the drop is shared pro-rata with the tenth of TVL that is points-eligible deposits; fees are a 0.3% swap plus one gas payment per transaction at the chain’s rate; the T-bill alternative pays 4% a year. ROBUST beats the T-bill at $25 an hour on a $500 deposit as well as on the plan’s deposit; FARM beats it at $10; THIN clears its fees; MARGINAL loses under $25; SKIP loses more. Change the deposit, drop share or horizon above and every verdict reprices — the $500 plan stays one click away in the deposit selector.</div>'
     + '<div class="formula">Snapshot: DefiLlama, ' + esc(D.as_of) + ' · floor $50M · ' + D.board_size + ' rows · ' + esc(D.source) + ' · no network: this page reads only data.js, written beside it by the same program that wrote board.json.</div>'
+    + '<div class="formula">impliedValue() = exp(' + b[0].toFixed(4) + curveTerm(b[1], 'ln TVL') + curveTerm(b[2], 'growth') + curveTerm(b[3], '(ln TVL − 18)²') + curveTerm(b[4], '(ln TVL − 18)³') + ') × categoryEffect() × tokenOdds()<br>'
+    + 'tokenOdds() = sigmoid(' + o[0].toFixed(2) + ' + ' + o[1].toFixed(2) + ' · size + ' + o[2].toFixed(2) + ' · ln months + ' + o[3].toFixed(2) + ' · age unknown ' + (o[4] < 0 ? '− ' : '+ ') + Math.abs(o[4]).toFixed(2) + ' · growth + ' + o[5].toFixed(2) + ' · sibling)<br>'
+    + 'R² ' + D.value_r2.toFixed(3) + ' on ' + D.value_comps + ' comps · category effects ×' + D.value_cat_min + ' to ×' + D.value_cat_max + ' (shrunk, ridge 50; comps winsorized 5–95%) · base token rate ' + (D.odds_base_rate * 100) + '% of ' + D.odds_peers + ' peers · model ' + esc(D.model_version) + ', refitted in this browser from the same data.</div>'
     + '</section>'
     + '<section class="panel live"><h2 style="padding:14px 14px 0">Live token view — already trading, at the market’s own value</h2><table><thead><tr><th>Protocol</th><th>Category</th><th>TVL</th><th>Market cap</th><th>7D</th></tr></thead><tbody>';
   D.live.forEach(function (r) {
@@ -476,6 +499,10 @@ function bindTable() {
   });
   var reset2 = document.getElementById('f-reset2');
   if (reset2) reset2.addEventListener('click', resetAll);
+  var csv2 = document.getElementById('f-csv2');
+  if (csv2) csv2.addEventListener('click', downloadCsv);
+  var json2 = document.getElementById('f-json2');
+  if (json2) json2.addEventListener('click', downloadJson);
 }
 
 function bindControls() {
@@ -561,10 +588,10 @@ function renderAll() {
     + '<p class="lede"><b>' + D.board_size + ' protocols that record no token, ranked by implied value</b> — value if a token launches × token odds, fitted on this snapshot’s own traded tokens and peers and backtested blind.</p>'
     + '<div class="formula-line">implied value = TVL × fitted multiple (×' + D.kpi.miss_wf.toFixed(2) + ' out-of-sample) × token odds</div></div>'
     + '<div class="top-meta"><span>DefiLlama snapshot ' + esc(D.as_of) + '</span><span>model ' + esc(D.model_version) + '</span><span>' + D.value_comps + ' comps · ' + D.odds_peers + ' peers</span><span>no network, no hand-picked names</span></div></header>'
-    + kpiCards() + accounting() + integrity()
+    + kpiCards() + accounting() + integrity() + evidence()
     + '<div id="controls-slot">' + controls() + '</div>'
     + '<div id="table-slot">' + table() + '</div>'
-    + evidence() + footnote()
+    + footnote()
     + '</div>'
     + '<div class="scrim" id="scrim" hidden></div>'
     + '<aside class="detail" id="detail" hidden aria-label="Protocol detail"></aside>';
