@@ -737,23 +737,283 @@ function oddsFeatures(p: SnapshotProtocol, asOf: string, sibling: boolean): numb
   ];
 }
 
-function fitLogit(X: number[][], y: number[], iters: number): number[] {
+function dot(row: number[], beta: number[]): number {
+  let z = 0;
+  for (let j = 0; j < row.length; j++) {
+    z += row[j] * beta[j];
+  }
+  return z;
+}
+
+function fitLogit(X: number[][], y: number[], iters: number, skip = -1): number[] {
   const k = X[0].length;
   const beta: number[] = Array(k).fill(0);
-  const m = y.reduce((t, v) => t + v, 0) / y.length;
+  const n = skip >= 0 ? X.length - 1 : X.length;
+  let mSum = 0;
+  for (let i = 0; i < y.length; i++) {
+    if (i !== skip) mSum += y[i];
+  }
+  const m = mSum / n;
   beta[0] = ln(m / (1 - m));
   const lr = 0.5;
   const l2 = 1e-3;
-  for (let step = 0; step < iters; step++) {
-    const grad: number[] = Array(k).fill(0);
-    for (let i = 0; i < X.length; i++) {
-      const pr = sigmoid(X[i].reduce((t, x, j) => t + x * beta[j], 0));
-      for (let j = 0; j < k; j++) {
-        grad[j] += (pr - y[i]) * X[i][j];
+  const Xlen = X.length;
+  // Per-k specialization: dot product and gradient unrolled by hand, beta and
+  // gradient kept in locals. Every accumulation keeps the exact original
+  // order (j = 0..k-1, rows in order), so results are bit-identical; only
+  // loop overhead and heap-array traffic are removed. Sigmoid is inlined
+  // with the same clamp and the same Math.exp call.
+  switch (k) {
+    case 1: {
+      let b0 = beta[0];
+      for (let step = 0; step < iters; step++) {
+        let g0 = 0;
+        for (let i = 0; i < Xlen; i++) {
+          if (i === skip) continue;
+          const xi = X[i];
+          let z = 0;
+          z += xi[0] * b0;
+          const cz = z > 30 ? 30 : z < -30 ? -30 : z;
+          const pr = 1 / (1 + Math.exp(-cz));
+          const d = pr - y[i];
+          g0 += d * xi[0];
+        }
+        b0 -= lr * (g0 / n);
       }
+      beta[0] = b0;
+      break;
     }
-    for (let j = 0; j < k; j++) {
-      beta[j] -= lr * (grad[j] / X.length + (j === 0 ? 0 : l2 * beta[j]));
+    case 2: {
+      let b0 = beta[0];
+      let b1 = beta[1];
+      for (let step = 0; step < iters; step++) {
+        let g0 = 0;
+        let g1 = 0;
+        for (let i = 0; i < Xlen; i++) {
+          if (i === skip) continue;
+          const xi = X[i];
+          let z = 0;
+          z += xi[0] * b0;
+          z += xi[1] * b1;
+          const cz = z > 30 ? 30 : z < -30 ? -30 : z;
+          const pr = 1 / (1 + Math.exp(-cz));
+          const d = pr - y[i];
+          g0 += d * xi[0];
+          g1 += d * xi[1];
+        }
+        b0 -= lr * (g0 / n);
+        b1 -= lr * (g1 / n + l2 * b1);
+      }
+      beta[0] = b0;
+      beta[1] = b1;
+      break;
+    }
+    case 4: {
+      let b0 = beta[0];
+      let b1 = beta[1];
+      let b2 = beta[2];
+      let b3 = beta[3];
+      for (let step = 0; step < iters; step++) {
+        let g0 = 0;
+        let g1 = 0;
+        let g2 = 0;
+        let g3 = 0;
+        for (let i = 0; i < Xlen; i++) {
+          if (i === skip) continue;
+          const xi = X[i];
+          let z = 0;
+          z += xi[0] * b0;
+          z += xi[1] * b1;
+          z += xi[2] * b2;
+          z += xi[3] * b3;
+          const cz = z > 30 ? 30 : z < -30 ? -30 : z;
+          const pr = 1 / (1 + Math.exp(-cz));
+          const d = pr - y[i];
+          g0 += d * xi[0];
+          g1 += d * xi[1];
+          g2 += d * xi[2];
+          g3 += d * xi[3];
+        }
+        b0 -= lr * (g0 / n);
+        b1 -= lr * (g1 / n + l2 * b1);
+        b2 -= lr * (g2 / n + l2 * b2);
+        b3 -= lr * (g3 / n + l2 * b3);
+      }
+      beta[0] = b0;
+      beta[1] = b1;
+      beta[2] = b2;
+      beta[3] = b3;
+      break;
+    }
+    case 5: {
+      let b0 = beta[0];
+      let b1 = beta[1];
+      let b2 = beta[2];
+      let b3 = beta[3];
+      let b4 = beta[4];
+      for (let step = 0; step < iters; step++) {
+        let g0 = 0;
+        let g1 = 0;
+        let g2 = 0;
+        let g3 = 0;
+        let g4 = 0;
+        for (let i = 0; i < Xlen; i++) {
+          if (i === skip) continue;
+          const xi = X[i];
+          let z = 0;
+          z += xi[0] * b0;
+          z += xi[1] * b1;
+          z += xi[2] * b2;
+          z += xi[3] * b3;
+          z += xi[4] * b4;
+          const cz = z > 30 ? 30 : z < -30 ? -30 : z;
+          const pr = 1 / (1 + Math.exp(-cz));
+          const d = pr - y[i];
+          g0 += d * xi[0];
+          g1 += d * xi[1];
+          g2 += d * xi[2];
+          g3 += d * xi[3];
+          g4 += d * xi[4];
+        }
+        b0 -= lr * (g0 / n);
+        b1 -= lr * (g1 / n + l2 * b1);
+        b2 -= lr * (g2 / n + l2 * b2);
+        b3 -= lr * (g3 / n + l2 * b3);
+        b4 -= lr * (g4 / n + l2 * b4);
+      }
+      beta[0] = b0;
+      beta[1] = b1;
+      beta[2] = b2;
+      beta[3] = b3;
+      beta[4] = b4;
+      break;
+    }
+    case 6: {
+      let b0 = beta[0];
+      let b1 = beta[1];
+      let b2 = beta[2];
+      let b3 = beta[3];
+      let b4 = beta[4];
+      let b5 = beta[5];
+      for (let step = 0; step < iters; step++) {
+        let g0 = 0;
+        let g1 = 0;
+        let g2 = 0;
+        let g3 = 0;
+        let g4 = 0;
+        let g5 = 0;
+        for (let i = 0; i < Xlen; i++) {
+          if (i === skip) continue;
+          const xi = X[i];
+          let z = 0;
+          z += xi[0] * b0;
+          z += xi[1] * b1;
+          z += xi[2] * b2;
+          z += xi[3] * b3;
+          z += xi[4] * b4;
+          z += xi[5] * b5;
+          const cz = z > 30 ? 30 : z < -30 ? -30 : z;
+          const pr = 1 / (1 + Math.exp(-cz));
+          const d = pr - y[i];
+          g0 += d * xi[0];
+          g1 += d * xi[1];
+          g2 += d * xi[2];
+          g3 += d * xi[3];
+          g4 += d * xi[4];
+          g5 += d * xi[5];
+        }
+        b0 -= lr * (g0 / n);
+        b1 -= lr * (g1 / n + l2 * b1);
+        b2 -= lr * (g2 / n + l2 * b2);
+        b3 -= lr * (g3 / n + l2 * b3);
+        b4 -= lr * (g4 / n + l2 * b4);
+        b5 -= lr * (g5 / n + l2 * b5);
+      }
+      beta[0] = b0;
+      beta[1] = b1;
+      beta[2] = b2;
+      beta[3] = b3;
+      beta[4] = b4;
+      beta[5] = b5;
+      break;
+    }
+    case 7: {
+      let b0 = beta[0];
+      let b1 = beta[1];
+      let b2 = beta[2];
+      let b3 = beta[3];
+      let b4 = beta[4];
+      let b5 = beta[5];
+      let b6 = beta[6];
+      for (let step = 0; step < iters; step++) {
+        let g0 = 0;
+        let g1 = 0;
+        let g2 = 0;
+        let g3 = 0;
+        let g4 = 0;
+        let g5 = 0;
+        let g6 = 0;
+        for (let i = 0; i < Xlen; i++) {
+          if (i === skip) continue;
+          const xi = X[i];
+          let z = 0;
+          z += xi[0] * b0;
+          z += xi[1] * b1;
+          z += xi[2] * b2;
+          z += xi[3] * b3;
+          z += xi[4] * b4;
+          z += xi[5] * b5;
+          z += xi[6] * b6;
+          const cz = z > 30 ? 30 : z < -30 ? -30 : z;
+          const pr = 1 / (1 + Math.exp(-cz));
+          const d = pr - y[i];
+          g0 += d * xi[0];
+          g1 += d * xi[1];
+          g2 += d * xi[2];
+          g3 += d * xi[3];
+          g4 += d * xi[4];
+          g5 += d * xi[5];
+          g6 += d * xi[6];
+        }
+        b0 -= lr * (g0 / n);
+        b1 -= lr * (g1 / n + l2 * b1);
+        b2 -= lr * (g2 / n + l2 * b2);
+        b3 -= lr * (g3 / n + l2 * b3);
+        b4 -= lr * (g4 / n + l2 * b4);
+        b5 -= lr * (g5 / n + l2 * b5);
+        b6 -= lr * (g6 / n + l2 * b6);
+      }
+      beta[0] = b0;
+      beta[1] = b1;
+      beta[2] = b2;
+      beta[3] = b3;
+      beta[4] = b4;
+      beta[5] = b5;
+      beta[6] = b6;
+      break;
+    }
+    default: {
+      const grad: number[] = Array(k).fill(0);
+      for (let step = 0; step < iters; step++) {
+        grad.fill(0);
+        for (let i = 0; i < Xlen; i++) {
+          if (i === skip) continue;
+          const xi = X[i];
+          const yi = y[i];
+          let z = 0;
+          for (let j = 0; j < k; j++) {
+            z += xi[j] * beta[j];
+          }
+          const pr = sigmoid(z);
+          for (let j = 0; j < k; j++) {
+            grad[j] += (pr - yi) * xi[j];
+          }
+        }
+        for (let j = 0; j < k; j++) {
+          beta[j] -= lr * (grad[j] / n + (j === 0 ? 0 : l2 * beta[j]));
+        }
+      }
+      break;
     }
   }
   return beta;
@@ -832,25 +1092,19 @@ export function backtestOdds(snapshot: Snapshot): OddsBacktest {
   ];
 
   function evalSet(cols: (p: SnapshotProtocol, i: number) => number[]): { loo: number; wf: number } {
+    const Xall = peers.map((p, i) => cols(p, i));
     const looP: number[] = [];
     for (let i = 0; i < peers.length; i++) {
-      const trainX: number[][] = [];
-      const trainY: number[] = [];
-      for (let j = 0; j < peers.length; j++) {
-        if (j === i) continue;
-        trainX.push(cols(peers[j], j));
-        trainY.push(y[j]);
-      }
-      const beta = fitLogit(trainX, trainY, 600);
-      looP.push(sigmoid(cols(peers[i], i).reduce((t, x, j) => t + x * beta[j], 0)));
+      const beta = fitLogit(Xall, y, 600, i);
+      looP.push(sigmoid(dot(Xall[i], beta)));
     }
     const beta = fitLogit(
-      trainIdx.map((i) => cols(peers[i], i)),
+      trainIdx.map((i) => Xall[i]),
       trainIdx.map((i) => y[i]),
       1200,
     );
     const wfIdx = dated.slice(half).map(({ i }) => i);
-    const wfP = wfIdx.map((i) => sigmoid(cols(peers[i], i).reduce((t, x, j) => t + x * beta[j], 0)));
+    const wfP = wfIdx.map((i) => sigmoid(dot(Xall[i], beta)));
     const wfY = wfIdx.map((i) => y[i]);
     return { loo: brier(looP, y), wf: brier(wfP, wfY) };
   }
@@ -881,30 +1135,29 @@ export function backtestOdds(snapshot: Snapshot): OddsBacktest {
     return eff;
   }
 
-  const catCols = (p: SnapshotProtocol, i: number, eff: Record<string, number>): number[] => [
-    ...oddsFeatures(p, snapshot.as_of, sibs[i]),
-    eff[p.category ?? 'null'] ?? 0,
-  ];
+  const baseX = peers.map((p, i) => oddsFeatures(p, snapshot.as_of, sibs[i]));
+  // One reusable trainX: rows are copies of baseX with the category column
+  // refilled per fold. fitLogit only reads its input, and the skipped row's
+  // column is never used, so the values fed to every fit are identical.
+  const trainX = baseX.map((row) => [...row, 0]);
   const catLooP: number[] = [];
   for (let i = 0; i < peers.length; i++) {
     const train = peers.filter((_, j) => j !== i);
     const eff = fitCat(train);
-    const trainY = y.filter((_, j) => j !== i);
-    const beta = fitLogit(
-      train.map((p, j) => catCols(p, j < i ? j : j + 1, eff)),
-      trainY,
-      600,
-    );
-    catLooP.push(sigmoid(catCols(peers[i], i, eff).reduce((t, x, j) => t + x * beta[j], 0)));
+    for (let j = 0; j < peers.length; j++) {
+      trainX[j][6] = eff[peers[j].category ?? 'null'] ?? 0;
+    }
+    const beta = fitLogit(trainX, y, 600, i);
+    catLooP.push(sigmoid(dot([...baseX[i], eff[peers[i].category ?? 'null'] ?? 0], beta)));
   }
   const catEffWf = fitCat(trainIdx.map((i) => peers[i]));
   const catBetaWf = fitLogit(
-    trainIdx.map((i) => catCols(peers[i], i, catEffWf)),
+    trainIdx.map((i) => [...baseX[i], catEffWf[peers[i].category ?? 'null'] ?? 0]),
     trainIdx.map((i) => y[i]),
     1200,
   );
   const wfIdx = dated.slice(half).map(({ i }) => i);
-  const catWfP = wfIdx.map((i) => sigmoid(catCols(peers[i], i, catEffWf).reduce((t, x, j) => t + x * catBetaWf[j], 0)));
+  const catWfP = wfIdx.map((i) => sigmoid(dot([...baseX[i], catEffWf[peers[i].category ?? 'null'] ?? 0], catBetaWf)));
   const catWfY = wfIdx.map((i) => y[i]);
   evidence.push({
     term: '+ category rate, shrunk',
@@ -916,31 +1169,21 @@ export function backtestOdds(snapshot: Snapshot): OddsBacktest {
 
   // Full model = set 5 (sibling).
   const full = sets[4];
-  const beta = fitLogit(
-    peers.map((p, i) => full.cols(p, i)),
-    y,
-    1200,
-  );
+  const fullX = peers.map((p, i) => full.cols(p, i));
+  const beta = fitLogit(fullX, y, 1200);
   const fullLoo = evidence[4];
   const looP: number[] = [];
   for (let i = 0; i < peers.length; i++) {
-    const trainX: number[][] = [];
-    const trainY: number[] = [];
-    for (let j = 0; j < peers.length; j++) {
-      if (j === i) continue;
-      trainX.push(full.cols(peers[j], j));
-      trainY.push(y[j]);
-    }
-    const b = fitLogit(trainX, trainY, 600);
-    looP.push(sigmoid(full.cols(peers[i], i).reduce((t, x, j) => t + x * b[j], 0)));
+    const b = fitLogit(fullX, y, 600, i);
+    looP.push(sigmoid(dot(fullX[i], b)));
   }
   const looAcc = looP.filter((pr, i) => (pr >= 0.5 ? 1 : 0) === y[i]).length / looP.length;
   const wb = fitLogit(
-    trainIdx.map((i) => full.cols(peers[i], i)),
+    trainIdx.map((i) => fullX[i]),
     trainIdx.map((i) => y[i]),
     1200,
   );
-  const wfP = wfIdx.map((i) => sigmoid(full.cols(peers[i], i).reduce((t, x, j) => t + x * wb[j], 0)));
+  const wfP = wfIdx.map((i) => sigmoid(dot(fullX[i], wb)));
   const wfY = wfIdx.map((i) => y[i]);
   const wfAcc = wfP.filter((pr, i) => (pr >= 0.5 ? 1 : 0) === wfY[i]).length / wfP.length;
 
