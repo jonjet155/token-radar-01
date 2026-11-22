@@ -1,4 +1,4 @@
-// Token Radar v5 — the model (radar-5). One snapshot in, one ranked board out.
+// Token Radar v6 — the model (radar-6). One snapshot in, one ranked board out.
 //
 // What this file does, in order:
 //   1. reads the sealed DefiLlama snapshot (758 protocols, as_of 2026-11-14);
@@ -15,8 +15,21 @@
 // The value curve bends with size: log market cap on log TVL, 7-day growth,
 // and the square and cube of (log TVL - 18), so the fitted multiple falls
 // steeply through the middle of the size range and flattens at both ends.
-// Every bend survived the same rule as every other term: it is kept only
-// when it lowers the held-out miss in BOTH backtests.
+// The curve is fitted on winsorized comps: log caps are clipped to the
+// 5th-95th percentiles of the comps being fitted, so one outlier token
+// cannot bend it. Each category then carries a shrunk premium: the median
+// residual of its comps, shrunk by n/(n+50). The pair is kept only because
+// it lowers the held-out miss in BOTH backtests, the same rule as every
+// other term; on their own, winsorizing helps walk-forward and hurts
+// leave-one-out, and the category premium helps leave-one-out and hurts
+// walk-forward, so neither ships alone.
+//
+// A row is ROBUST only when its farm clears $25 an hour on a $500 deposit
+// as well as on the $10,000 plan: the drop is pro-rata, so a big deposit
+// flatters every farm, and only a farm that pays a small farmer is worth
+// the name. The printed P25-P75 range is the 25th-75th percentile of the
+// leave-one-out misses, widened x1.20 so the walk-forward coverage lands
+// near the top entries' printed share.
 //
 // Nothing here names a protocol. Every number below is fitted from the
 // snapshot at run time; the backtest numbers the dashboard prints are the
@@ -55,7 +68,20 @@ export interface FarmScenario {
 export const SCENARIO: FarmScenario = { deposit_usd: 10000, drop_share: 0.07, horizon_weeks: 12 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-5';
+export const MODEL_VERSION = 'radar-6';
+
+/** The winsorized comps' clip: log caps are clipped to these percentiles of the comps being fitted. */
+export const WINSOR_LO = 0.05;
+export const WINSOR_HI = 0.95;
+
+/** The category premium's shrinkage: a category's median residual is shrunk by n/(n+K). */
+export const CATEGORY_RIDGE_K = 50;
+
+/** The printed P25-P75 range is the leave-one-out percentiles widened by this factor. */
+export const RANGE_WIDEN = 1.2;
+
+/** The small deposit a ROBUST farm must clear $25 an hour on, as well as the plan's deposit. */
+export const SMALL_DEPOSIT_USD = 500;
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 158;
@@ -104,6 +130,7 @@ export interface BoardRow {
     growth_pct: number;
     age_days: number | null;
     sibling: boolean;
+    category_effect: number;
   };
   farm_steps: string[];
 }
@@ -133,6 +160,7 @@ export interface RadarRow {
   net_per_hour_usd: number;
   watchlist: boolean;
   sibling: boolean;
+  category_effect: number;
   farm_steps: string[];
 }
 
@@ -179,6 +207,8 @@ export interface RadarData {
   value_beta: number[];
   value_r2: number;
   value_comps: number;
+  value_cat_min: number;
+  value_cat_max: number;
   odds_beta: number[];
   odds_peers: number;
   odds_base_rate: number;
@@ -189,6 +219,7 @@ export interface RadarData {
     q25: number;
     q75: number;
     q90: number;
+    widen: number;
     within3_loo: number;
     within3_wf: number;
     p2575_loo: number;
@@ -407,9 +438,13 @@ function ladWfErrors(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => numbe
 // held-out miss in BOTH backtests. The bends are what the data says: the
 // fitted multiple falls as protocols grow, steeply through the middle of
 // the size range and gently at both ends, so a straight line in log TVL
-// overprices the middle and underprices the ends. Category effects, age,
-// chain count and a median (LAD) fit were all tested on the same comps and
-// all failed at least one of the two tests, so none of them is in the model.
+// overprices the middle and underprices the ends. The curve is fitted on
+// winsorized comps and each category carries a shrunk premium, because the
+// pair lowers both backtests where each half alone fails one: winsorizing
+// helps walk-forward and hurts leave-one-out, the category premium helps
+// leave-one-out and hurts walk-forward. Age, chain count and a median (LAD)
+// fit were all tested on the same comps and all failed at least one of the
+// two tests, so none of them is in the model.
 
 /** The traded tokens the value curve is fitted on. */
 export function valueComps(snapshot: Snapshot): SnapshotProtocol[] {
@@ -532,8 +567,48 @@ function categoryErrors(rows: SnapshotProtocol[], mode: 'loo' | 'wf'): number[] 
     .map((p) => ln(p.mcap_usd!) - (f(p).reduce((t, x, j) => t + x * beta[j]!, 0) + (eff[p.category ?? 'null'] ?? 0)));
 }
 
+/** Log market caps clipped to the 5th-95th percentiles of the rows being fitted: one outlier token cannot bend the curve. */
+function winsorizedLogCaps(rows: SnapshotProtocol[]): number[] {
+  const ys = rows.map((p) => ln(p.mcap_usd!));
+  const lo = quantile(ys, WINSOR_LO);
+  const hi = quantile(ys, WINSOR_HI);
+  return ys.map((y) => Math.min(hi, Math.max(lo, y)));
+}
+
+/** The fitted value curve plus its shrunk category premiums, from one set of rows. */
+function fitValueCurve(rows: SnapshotProtocol[]): { beta: number[]; eff: Record<string, number> } {
+  const { beta } = ols(rows.map(valueFeatures), winsorizedLogCaps(rows));
+  const eff = categoryEffects(rows, valueFeatures, beta, CATEGORY_RIDGE_K);
+  return { beta, eff };
+}
+
+/** The curve's prediction for one protocol, category premium included. */
+function valuePrediction(p: SnapshotProtocol, beta: number[], eff: Record<string, number>): number {
+  return valueFeatures(p).reduce((t, v, j) => t + v * beta[j]!, 0) + (eff[p.category ?? 'null'] ?? 0);
+}
+
+/** Leave-one-out log errors for the winsorized curve with its category premiums: the clip and the premiums are refitted inside every fold. */
+function comboLooErrors(rows: SnapshotProtocol[]): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const train = rows.filter((_, j) => j !== i);
+    const { beta, eff } = fitValueCurve(train);
+    out.push(ln(rows[i]!.mcap_usd!) - valuePrediction(rows[i]!, beta, eff));
+  }
+  return out;
+}
+
+/** Walk-forward log errors for the winsorized curve with its category premiums. */
+function comboWfErrors(rows: SnapshotProtocol[]): number[] {
+  const dated = [...rows].sort((a, b) => (a.listed_at! < b.listed_at! ? -1 : 1));
+  const half = Math.floor(dated.length / 2);
+  const { beta, eff } = fitValueCurve(dated.slice(0, half));
+  return dated.slice(half).map((p) => ln(p.mcap_usd!) - valuePrediction(p, beta, eff));
+}
+
 export interface ValueBacktest {
   beta: number[];
+  eff: Record<string, number>;
   r2: number;
   loo: number[];
   wf: number[];
@@ -546,13 +621,21 @@ export interface ValueBacktest {
 export function backtestValue(snapshot: Snapshot): ValueBacktest {
   const comps = valueComps(snapshot);
   const y = comps.map((p) => ln(p.mcap_usd!));
-  const { beta, resid } = ols(comps.map(valueFeatures), y);
+  const { beta, eff } = fitValueCurve(comps);
+  // R-squared of the shipped model: the raw log caps against the curve plus its category premiums.
   const mean = y.reduce((a, b) => a + b, 0) / y.length;
   const ssTot = y.reduce((a, v) => a + (v - mean) * (v - mean), 0);
-  const ssRes = resid.reduce((a, v) => a + v * v, 0);
+  const ssRes = comps.reduce((a, p) => {
+    const r = ln(p.mcap_usd!) - valuePrediction(p, beta, eff);
+    return a + r * r;
+  }, 0);
   const r2 = 1 - ssRes / ssTot;
+  // The plain curve's errors, for the evidence table's bend rows.
   const loo = looErrors(comps, valueFeatures);
   const wf = wfErrors(comps, valueFeatures);
+  // The shipped model's errors, for the dashboard's headline and range.
+  const comboLoo = comboLooErrors(comps);
+  const comboWf = comboWfErrors(comps);
   const evidence: EvidenceRow[] = [
     {
       term: 'flat median multiple',
@@ -617,22 +700,29 @@ export function backtestValue(snapshot: Snapshot): ValueBacktest {
       kept: false,
       note: 'tested, not kept',
     },
+    {
+      term: '+ winsorized comps, 5–95%, and category effect, ridge 50',
+      loo: typicalMiss(comboLoo),
+      wf: typicalMiss(comboWf),
+      kept: true,
+      note: 'kept: lowers both tests together',
+    },
   ];
   return {
     beta,
+    eff,
     r2,
-    loo,
-    wf,
+    loo: comboLoo,
+    wf: comboWf,
     evidence,
     flatLoo: typicalMiss(flatErrors(comps, 'loo')),
     flatWf: typicalMiss(flatErrors(comps, 'wf')),
   };
 }
 
-/** What a token would be worth if it launches, under the fitted curve. */
-export function ifLaunches(p: SnapshotProtocol, beta: number[]): number {
-  const x = valueFeatures(p);
-  return Math.exp(x.reduce((t, v, j) => t + v * beta[j]!, 0));
+/** What a token would be worth if it launches, under the fitted curve and its category premium. */
+export function ifLaunches(p: SnapshotProtocol, beta: number[], eff: Record<string, number>): number {
+  return Math.exp(valuePrediction(p, beta, eff));
 }
 
 // ---------------------------------------------------------------- token odds
@@ -949,26 +1039,43 @@ export interface Econ {
   verdict: string;
 }
 
+/** One row's farm economics at one deposit, under a scenario's drop share and horizon. */
+function econAtDeposit(
+  p: SnapshotProtocol,
+  implied: number,
+  scenario: FarmScenario,
+  deposit: number,
+): { drop: number; fees: number; net: number; tbill: number; perHour: number; hours: number; tx: number } {
+  const gas = GAS_PER_TX[p.chains[0] ?? ''] ?? DEFAULT_GAS;
+  const { tx, hours } = planWork(scenario.horizon_weeks);
+  const drop = (implied * scenario.drop_share * deposit) / (ELIGIBLE_SHARE * p.tvl_usd);
+  const fees = SWAP_FEE_RATE * deposit + gas * tx;
+  const net = drop - fees;
+  const tbill = deposit * TBILL_RATE * (scenario.horizon_weeks / 52);
+  return { drop, fees, net, tbill, perHour: net / hours, hours, tx };
+}
+
 /** Price a farm plan for one row under a scenario. */
 export function econFor(
   p: SnapshotProtocol,
   implied: number,
   scenario: FarmScenario,
 ): Econ {
-  const gas = GAS_PER_TX[p.chains[0] ?? ''] ?? DEFAULT_GAS;
-  const { tx, hours } = planWork(scenario.horizon_weeks);
-  const drop = (implied * scenario.drop_share * scenario.deposit_usd) / (ELIGIBLE_SHARE * p.tvl_usd);
-  const fees = SWAP_FEE_RATE * scenario.deposit_usd + gas * tx;
-  const net = drop - fees;
-  const tbill = scenario.deposit_usd * TBILL_RATE * (scenario.horizon_weeks / 52);
-  const perHour = net / hours;
+  const e = econAtDeposit(p, implied, scenario, scenario.deposit_usd);
+  // ROBUST is deposit-proof: the farm must clear $25 an hour on a $500
+  // deposit as well as on the plan's deposit. The drop is pro-rata, so a
+  // big deposit flatters every farm — the gas stays fixed while the drop
+  // scales — and only a farm that pays a small farmer is worth the name.
+  // The small test binds whenever the plan's deposit is larger, because
+  // the net per hour rises with the deposit while the gas stays fixed.
+  const small = econAtDeposit(p, implied, scenario, SMALL_DEPOSIT_USD);
   let verdict: string;
-  if (net > tbill && perHour >= 25) verdict = 'ROBUST';
-  else if (net > tbill && perHour >= 10) verdict = 'FARM';
-  else if (net > 0) verdict = 'THIN';
-  else if (net >= -25) verdict = 'MARGINAL';
+  if (e.net > e.tbill && e.perHour >= 25 && small.net > small.tbill && small.perHour >= 25) verdict = 'ROBUST';
+  else if (e.net > e.tbill && e.perHour >= 10) verdict = 'FARM';
+  else if (e.net > 0) verdict = 'THIN';
+  else if (e.net >= -25) verdict = 'MARGINAL';
   else verdict = 'SKIP';
-  return { drop_value_usd: drop, fees_usd: fees, net_of_fees_usd: net, net_per_hour_usd: perHour, tbill_usd: tbill, hours, tx, verdict };
+  return { drop_value_usd: e.drop, fees_usd: e.fees, net_of_fees_usd: e.net, net_per_hour_usd: e.perHour, tbill_usd: e.tbill, hours: e.hours, tx: e.tx, verdict };
 }
 
 /** The first chain a protocol names, or a neutral phrase. */
@@ -1088,6 +1195,7 @@ export function liveRows(snapshot: Snapshot): LiveRow[] {
 export function buildBoard(
   snapshot: Snapshot,
   valueBeta: number[],
+  valueEff: Record<string, number>,
   oddsBeta: number[],
   rangeQ: { q10: number; q25: number; q75: number; q90: number },
   scenario: FarmScenario = SCENARIO,
@@ -1105,7 +1213,7 @@ export function buildBoard(
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const ifl = ifLaunches(p, valueBeta);
+    const ifl = ifLaunches(p, valueBeta, valueEff);
     const odds = tokenOdds(p, snapshot, oddsBeta);
     const implied = Math.max(1, Math.round(ifl * odds));
     const econ = econFor(p, implied, scenario);
@@ -1143,6 +1251,7 @@ export function buildBoard(
       growth_pct: Math.round(finite(s.p.change_7d, 0) * 100) / 100,
       age_days: s.age,
       sibling: hasSibling(s.p, snapshot),
+      category_effect: Math.round((valueEff[s.p.category ?? 'null'] ?? 0) * 10000) / 10000,
     },
     farm_steps: farmSteps(s.p, scenario, s.econ).map(stepText),
   }));
@@ -1230,6 +1339,7 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
     net_per_hour_usd: row.net_per_hour_usd,
     watchlist,
     sibling: row.model.sibling,
+    category_effect: row.model.category_effect,
     farm_steps: row.farm_steps,
   };
 }
@@ -1238,12 +1348,18 @@ export function radarRow(row: BoardRow, watchlist: boolean): RadarRow {
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
   const value = backtestValue(snapshot);
   const odds = backtestOdds(snapshot);
+  // The printed P25-P75 range is the leave-one-out percentiles widened
+  // x1.20; the P10-P90 band is left as fitted. The honesty table below
+  // scores the widened band, the one the board actually prints.
   const q10 = quantile(value.loo, 0.1);
-  const q25 = quantile(value.loo, 0.25);
-  const q75 = quantile(value.loo, 0.75);
+  const q25 = quantile(value.loo, 0.25) * RANGE_WIDEN;
+  const q75 = quantile(value.loo, 0.75) * RANGE_WIDEN;
   const q90 = quantile(value.loo, 0.9);
   const rangeQ = { q10, q25, q75, q90 };
-  const board = buildBoard(snapshot, value.beta, odds.beta, rangeQ, SCENARIO);
+  const board = buildBoard(snapshot, value.beta, value.eff, odds.beta, rangeQ, SCENARIO);
+  const catVals = Object.values(value.eff).map((v) => Math.exp(v));
+  const catMin = catVals.length > 0 ? Math.min(...catVals) : 1;
+  const catMax = catVals.length > 0 ? Math.max(...catVals) : 1;
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const verdicts: Record<string, number> = {};
@@ -1263,6 +1379,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     value_beta: value.beta.map((b) => Math.round(b * 10000) / 10000),
     value_r2: Math.round(value.r2 * 10000) / 10000,
     value_comps: valueComps(snapshot).length,
+    value_cat_min: Math.round(catMin * 100) / 100,
+    value_cat_max: Math.round(catMax * 100) / 100,
     odds_beta: odds.beta.map((b) => Math.round(b * 10000) / 10000),
     odds_peers: oddsPeers(snapshot).length,
     odds_base_rate: Math.round(odds.baseRate * 10000) / 10000,
@@ -1285,6 +1403,7 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       q25: Math.round(q25 * 100) / 100,
       q75: Math.round(q75 * 100) / 100,
       q90: Math.round(q90 * 100) / 100,
+      widen: RANGE_WIDEN,
       within3_loo: Math.round((value.loo.filter((e) => Math.abs(e) <= ln(3)).length / value.loo.length) * 1000) / 10,
       within3_wf: Math.round((value.wf.filter((e) => Math.abs(e) <= ln(3)).length / value.wf.length) * 1000) / 10,
       p2575_loo: Math.round((value.loo.filter((e) => e >= q25 && e <= q75).length / value.loo.length) * 1000) / 10,

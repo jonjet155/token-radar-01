@@ -1,7 +1,7 @@
-// Token Radar v4 (Node 22, standard library only).
+// Token Radar v6 (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or
-// --input <file|dir>), fits the radar-4 model in lib/model.ts, writes the
+// --input <file|dir>), fits the radar-6 model in lib/model.ts, writes the
 // ranked board to /output/board.json, writes the dashboard's data beside
 // the page as /output/data.js, copies this repository's dashboard/ and
 // screenshots/ to /output, and writes /output/dossier.json with the

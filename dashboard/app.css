@@ -108,6 +108,8 @@ a { color: var(--accent); }
 .button:hover { border-color: var(--muted); }
 .dep-note { flex-basis: 100%; color: var(--muted); font-size: 12px; margin-top: 2px; }
 .dep-note b { color: var(--ink); font-weight: 600; }
+.verdict-legend { padding: 10px 14px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; line-height: 1.6; }
+.verdict-legend b { color: var(--ink); font-weight: 600; }
 
 /* Table — tight rows so the first viewport holds twenty */
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel); overflow: hidden; }
