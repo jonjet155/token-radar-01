@@ -1,19 +1,24 @@
-// Launch Radar (model radar-7): rank pre-token DefiLlama protocols by
+// Launch Radar (model radar-8): rank pre-token DefiLlama protocols by
 // implied launch value and price a farm plan for each row.
 //
 // Five steps, all fitted on the snapshot itself:
-//  1. Fit a value curve on the traded tokens: log market cap on log TVL,
-//     7-day TVL growth (capped at ±30%, so a crash cannot 5x a value)
-//     and a bend in size, with comps winsorized 5-95%
-//     and a shrunk category premium (ridge 50). Every term is kept only
-//     if it lowers the held-out miss in both leave-one-out and
-//     walk-forward (earlier listings price later ones).
+//  1. Fit a value curve on the traded tokens: log market cap on log TVL
+//     and a bend in size, with comps winsorized 5-95%. Every value term
+//     was kept only if it lowers the held-out miss in BOTH leave-one-out
+//     and walk-forward (earlier listings price later ones). The term
+//     tournament (see backtestValue) keeps size + the bend and drops the
+//     cubic, 7-day growth, chain count, age, the category effect and a
+//     control term. Growth is out of value on purpose: the capped form
+//     lowers both tests only by paying crashes (coefficient -2.05), and
+//     the crash-safe form max(0, growth) fails walk-forward x4.36, so a
+//     crash can never raise a value here. Growth enters through the odds.
 //  2. Fit token odds on the standing peers: a logistic model on size,
 //     no-token age, 7-day growth and whether a namesake sibling exists.
 //  3. implied value = exp(value curve) x token odds, per protocol.
 //  4. Price the farm: the drop is shared pro-rata with the protocol's
 //     TVL; fees are a 0.3% swap plus one gas payment per transaction; the
-//     at $25 an hour on a $500 deposit as well as on the plan deposit.
+//     verdict also checks the plan at $25 an hour on a $500 deposit as
+//     well as on the plan deposit.
 //  5. Print the range from the leave-one-out misses, widened x1.2, so the
 //     P25-P75 band is an honest statement about the curve's own error.
 //
@@ -65,7 +70,7 @@ export interface RadarData {
   odds_beta: number[]; odds_peers: number; odds_base_rate: number;
   value_evidence: EvidenceRow[]; odds_evidence: EvidenceRow[];
   range: { q10: number; q25: number; q75: number; q90: number; widen: number; within3_loo: number; within3_wf: number; p2575_loo: number; p2575_wf: number; p1090_loo: number; p1090_wf: number };
-  kpi: { miss_wf: number; miss_flat_wf: number; miss_loo: number; brier_wf: number; brier_base_wf: number; brier_loo: number; odds_acc_wf: number; odds_acc_loo: number; odds_acc_insample: number; value_kept: number; value_tested: number; odds_kept: number; odds_tested: number; worth_farming: number; skip_count: number; verdicts: Record<string, number> };
+  kpi: { miss_wf: number; miss_flat_wf: number; miss_loo: number; brier_wf: number; brier_base_wf: number; brier_loo: number; odds_acc_wf: number; odds_acc_loo: number; odds_acc_insample: number; odds_prec_low_wf: number; odds_prec_low_n_wf: number; odds_prec_low_loo: number; odds_prec_low_n_loo: number; odds_prec_high_wf: number; odds_prec_high_n_wf: number; value_kept: number; value_tested: number; odds_kept: number; odds_tested: number; worth_farming: number; skip_count: number; verdicts: Record<string, number> };
   accounting: AccountGroup[]; rows: RadarRow[]; live: LiveRow[]; gas: Record<string, number>;
 }
 export interface ValueBacktest {
@@ -75,6 +80,12 @@ export interface ValueBacktest {
 export interface OddsBacktest {
   beta: number[]; baseRate: number; loo: number; wf: number; looAcc: number; wfAcc: number;
   insampleAcc: number; baseLoo: number; baseWf: number; evidence: EvidenceRow[];
+  // Precision on the confident subsets, held-out: the honest equivalent of
+  // a headline accuracy. Low = the peers called unlikely (odds <= 10%):
+  // how many recorded no token. High = the peers called likely (>= 70%).
+  // Conf = accuracy on either extreme (odds >= 90% or <= 10%).
+  precLowLoo: number; precLowNLoo: number; precLowWf: number; precLowNWf: number;
+  precHighWf: number; precHighNWf: number; confAccWf: number; confNWf: number;
 }
 export interface Econ {
   drop_value_usd: number; fees_usd: number; net_of_fees_usd: number;
@@ -85,7 +96,7 @@ export class SnapshotError extends Error {
 }
 
 export const SCENARIO: FarmScenario = { deposit_usd: 10000, drop_share: 0.07, horizon_weeks: 12 };
-export const MODEL_VERSION = 'radar-7';
+export const MODEL_VERSION = 'radar-8';
 export const WINSOR_LO = 0.05;
 export const WINSOR_HI = 0.95;
 export const CATEGORY_RIDGE_K = 50;
@@ -144,11 +155,162 @@ export function isRankable(p: SnapshotProtocol): boolean {
 function growthFrac(p: SnapshotProtocol): number {
   return Math.min(1.2, Math.max(-0.6, finite(p.change_7d, 0) / 100));
 }
-// Value-side growth is capped at ±30%: a protocol whose TVL crashed 70%
-// in a week must not earn a 5x value boost from the fall alone. (The odds
-// model keeps the uncapped growthFrac: there it only shifts a probability.)
-function growthFracCapped(p: SnapshotProtocol): number {
-  return Math.min(0.3, Math.max(-0.3, finite(p.change_7d, 0) / 100));
+// --- Value model (radar-8): log market cap on log TVL and a bend in size ---
+// Term tournament, every variant fitted on winsorized comps (5-95%) and
+// scored by typical miss in BOTH leave-one-out and walk-forward:
+//   flat median multiple                x4.89   x5.33   baseline
+//   size curve, ln TVL                  x3.38   x2.86   kept
+//   + size bend, (ln TVL-18)^2          x3.21   x2.49   kept
+//   + size bend, (ln TVL-18)^3          x3.47   x2.37   not kept: LOO worse
+//   + 7-day growth, capped +/-30%       x2.84   x2.45   not kept: lowers both
+//       only by paying crashes (coefficient -2.05); the crash-safe form
+//       max(0, growth) fails walk-forward at x4.36, so growth stays out
+//   + 7-day growth, crash-safe max(0,g) x3.15   x4.36   not kept
+//   + chain count, ln                   x3.33   x2.68   not kept
+//   + no-token age, ln                  x3.25   x2.93   not kept
+//   + category effect, ridge 50         x3.21   x2.49   not kept: no gain
+//   + control: growth of another row    x3.43   x2.64   must not help
+//   same features, unwinsorized         x3.28   x2.64   not kept
+// A term is kept only if the model with it beats the model without it in
+// both tests. The kept model is size + the bend: two terms, no category,
+// no growth, no cubic. Growth helps tell which peers record a token, so
+// it enters through the odds only.
+export function valueComps(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter((p) => (p.mcap_usd ?? 0) > 0 && p.tvl_usd > 0 && p.listed_at !== null);
+}
+function sizeCentre(p: SnapshotProtocol): number { return ln(p.tvl_usd) - 18; }
+// Control term: the 7-day growth of ANOTHER row (next slug in order). It
+// must not help; if it did, the growth signal itself would be suspect.
+function controlGrowth(comps: SnapshotProtocol[]): Map<string, number> {
+  const sorted = [...comps].sort((a, b) => (a.slug < b.slug ? -1 : 1));
+  const m = new Map<string, number>();
+  sorted.forEach((p, i) => {
+    const other = sorted[(i + 1) % sorted.length];
+    m.set(p.slug, Math.min(0.3, Math.max(-0.3, finite(other.change_7d, 0) / 100)));
+  });
+  return m;
+}
+function valueFeaturesFor(p: SnapshotProtocol, spec: string[], ctrl: Map<string, number>, asOf: string): number[] {
+  const t = sizeCentre(p);
+  const g = finite(p.change_7d, 0) / 100;
+  const age = ageDays(asOf, p.listed_at);
+  const out = [1, ln(p.tvl_usd)];
+  if (spec.includes('quad')) out.push(t * t);
+  if (spec.includes('cubic')) out.push(t * t * t);
+  if (spec.includes('growthCap')) out.push(Math.min(0.3, Math.max(-0.3, g)));
+  if (spec.includes('growthPos')) out.push(Math.max(0, g));
+  if (spec.includes('chain')) out.push(ln(Math.max(1, p.chains.length)));
+  if (spec.includes('age')) out.push(ln(1 + (age ?? 365) / 365));
+  if (spec.includes('control')) out.push(ctrl.get(p.slug) ?? 0);
+  return out;
+}
+function flatErrors(rows: SnapshotProtocol[], mode: 'loo' | 'wf'): number[] {
+  if (mode === 'loo') {
+    const out: number[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const ratios = rows.filter((_, j) => j !== i).map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b);
+      const m = ratios[Math.floor(ratios.length / 2)];
+      out.push(ln(rows[i].mcap_usd as number) - ln(m * rows[i].tvl_usd));
+    }
+    return out;
+  }
+  const sorted = [...rows].sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
+  const half = Math.floor(sorted.length / 2);
+  const ratios = sorted.slice(0, half).map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b);
+  const m = ratios[Math.floor(ratios.length / 2)];
+  return sorted.slice(half).map((p) => ln(p.mcap_usd as number) - ln(m * p.tvl_usd));
+}
+function categoryEffects(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => number[], beta: number[], shrinkK: number): Record<string, number> {
+  const groups = new Map<string, number[]>();
+  for (const p of rows) {
+    const resid = ln(p.mcap_usd as number) - f(p).reduce((t, x, j) => t + x * beta[j], 0);
+    const key = p.category ?? 'null';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(resid);
+  }
+  const eff: Record<string, number> = {};
+  for (const [key, rs] of groups) {
+    if (rs.length >= 3) eff[key] = median(rs) * (rs.length / (rs.length + shrinkK));
+  }
+  return eff;
+}
+function winsorizedLogCaps(rows: SnapshotProtocol[]): number[] {
+  const ys = rows.map((p) => ln(p.mcap_usd as number));
+  const lo = quantile(ys, WINSOR_LO);
+  const hi = quantile(ys, WINSOR_HI);
+  return ys.map((y) => Math.min(hi, Math.max(lo, y)));
+}
+interface ValueFit { beta: number[]; eff: Record<string, number>; f: (p: SnapshotProtocol) => number[]; }
+function fitValue(rows: SnapshotProtocol[], spec: string[], ctrl: Map<string, number>, asOf: string, winsorize: boolean, catK: number): ValueFit {
+  const f = (p: SnapshotProtocol): number[] => valueFeaturesFor(p, spec, ctrl, asOf);
+  const ys = winsorize ? winsorizedLogCaps(rows) : rows.map((p) => ln(p.mcap_usd as number));
+  const beta = ols(rows.map(f), ys).beta;
+  const eff = catK > 0 ? categoryEffects(rows, f, beta, catK) : {};
+  return { beta, eff, f };
+}
+function valuePrediction(p: SnapshotProtocol, fit: ValueFit): number {
+  return fit.f(p).reduce((t, x, j) => t + x * fit.beta[j], 0) + (fit.eff[p.category ?? 'null'] ?? 0);
+}
+function variantErrors(rows: SnapshotProtocol[], spec: string[], ctrl: Map<string, number>, asOf: string, winsorize: boolean, catK: number, mode: 'loo' | 'wf'): number[] {
+  if (mode === 'loo') {
+    const out: number[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const train = rows.filter((_, j) => j !== i);
+      const fit = fitValue(train, spec, ctrl, asOf, winsorize, catK);
+      out.push(ln(rows[i].mcap_usd as number) - valuePrediction(rows[i], fit));
+    }
+    return out;
+  }
+  const sorted = [...rows].sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
+  const half = Math.floor(sorted.length / 2);
+  const fit = fitValue(sorted.slice(0, half), spec, ctrl, asOf, winsorize, catK);
+  return sorted.slice(half).map((p) => ln(p.mcap_usd as number) - valuePrediction(p, fit));
+}
+export function backtestValue(snapshot: Snapshot): ValueBacktest {
+  const comps = valueComps(snapshot);
+  const ctrl = controlGrowth(comps);
+  const asOf = snapshot.as_of;
+  const ev = (term: string, spec: string[], winsorize: boolean, catK: number, kept: boolean, note: string): EvidenceRow => ({
+    term,
+    loo: typicalMiss(variantErrors(comps, spec, ctrl, asOf, winsorize, catK, 'loo')),
+    wf: typicalMiss(variantErrors(comps, spec, ctrl, asOf, winsorize, catK, 'wf')),
+    kept, note,
+  });
+  // The kept model: size + the bend, winsorized, no category.
+  const keptSpec = ['quad'];
+  const fit = fitValue(comps, keptSpec, ctrl, asOf, true, 0);
+  const loo = variantErrors(comps, keptSpec, ctrl, asOf, true, 0, 'loo');
+  const wf = variantErrors(comps, keptSpec, ctrl, asOf, true, 0, 'wf');
+  const y = comps.map((p) => ln(p.mcap_usd as number));
+  const mean = y.reduce((t, v) => t + v, 0) / y.length;
+  const ssTot = y.reduce((t, v) => t + (v - mean) * (v - mean), 0);
+  const ssRes = comps.reduce((t, p) => {
+    const d = ln(p.mcap_usd as number) - valuePrediction(p, fit);
+    return t + d * d;
+  }, 0);
+  const r2 = 1 - ssRes / ssTot;
+  const evidence: EvidenceRow[] = [
+    { term: 'flat median multiple', loo: typicalMiss(flatErrors(comps, 'loo')), wf: typicalMiss(flatErrors(comps, 'wf')), kept: false, note: 'baseline' },
+    ev('size curve, ln TVL', [], true, 0, true, 'kept'),
+    ev('+ bend, (ln TVL\u221218)\u00b2', ['quad'], true, 0, true, 'kept: lowers both tests'),
+    ev('+ bend, (ln TVL\u221218)\u00b3', ['quad', 'cubic'], true, 0, false, 'tested, not kept: LOO worse'),
+    ev('+ growth, capped \u00b130%', ['quad', 'growthCap'], true, 0, false, 'tested, not kept: lowers both only by paying crashes (coef \u22122.05)'),
+    ev('+ growth, max(0,g)', ['quad', 'growthPos'], true, 0, false, 'tested, not kept: walk-forward x4.36'),
+    ev('+ chain count, ln', ['quad', 'chain'], true, 0, false, 'tested, not kept'),
+    ev('+ no-token age, ln', ['quad', 'age'], true, 0, false, 'tested, not kept'),
+    ev('+ category, ridge 50', ['quad'], true, 50, false, 'tested, not kept: no gain on either test'),
+    ev('+ control: other growth', ['quad', 'control'], true, 0, false, 'must not help'),
+    ev('same model, unwinsorized', ['quad'], false, 0, false, 'tested, not kept: winsorize wins both tests'),
+  ];
+  return {
+    beta: fit.beta, eff: fit.eff, r2, loo, wf, evidence,
+    flatLoo: typicalMiss(flatErrors(comps, 'loo')),
+    flatWf: typicalMiss(flatErrors(comps, 'wf')),
+  };
+}
+export function ifLaunches(p: SnapshotProtocol, beta: number[], eff: Record<string, number>): number {
+  const fit: ValueFit = { beta, eff, f: (q) => valueFeaturesFor(q, ['quad'], new Map(), '') };
+  return Math.exp(valuePrediction(p, fit));
 }
 
 // --- Regression: OLS / WOLS / LAD (order of operations is load-bearing) ---
@@ -229,159 +391,7 @@ function ladWfErrors(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => numbe
   return sorted.slice(half).map((p) => ln(p.mcap_usd as number) - f(p).reduce((t, x, j) => t + x * beta[j], 0));
 }
 
-// --- Value model: log market cap on log TVL, growth and a size bend ---
-export function valueComps(snapshot: Snapshot): SnapshotProtocol[] {
-  return snapshot.protocols.filter((p) => (p.mcap_usd ?? 0) > 0 && p.tvl_usd > 0 && p.listed_at !== null);
-}
-function sizeCentre(p: SnapshotProtocol): number { return ln(p.tvl_usd) - 18; }
-function valueFeatures(p: SnapshotProtocol): number[] {
-  const t = sizeCentre(p);
-  return [1, ln(p.tvl_usd), growthFracCapped(p), t * t, t * t * t];
-}
-function valueFeaturesT2(p: SnapshotProtocol): number[] {
-  const t = sizeCentre(p);
-  return [1, ln(p.tvl_usd), growthFracCapped(p), t * t];
-}
-function valueFeaturesChains(p: SnapshotProtocol): number[] {
-  return [...valueFeatures(p), ln(Math.max(1, p.chains.length))];
-}
-function valueFeaturesAge(p: SnapshotProtocol, asOf: string): number[] {
-  const age = ageDays(asOf, p.listed_at);
-  return [...valueFeatures(p), ln(1 + (age ?? 365) / 365)];
-}
-function looErrors(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => number[]): number[] {
-  const out: number[] = [];
-  for (let i = 0; i < rows.length; i++) {
-    const train = rows.filter((_, j) => j !== i);
-    const beta = ols(train.map(f), train.map((p) => ln(p.mcap_usd as number))).beta;
-    out.push(ln(rows[i].mcap_usd as number) - f(rows[i]).reduce((t, x, j) => t + x * beta[j], 0));
-  }
-  return out;
-}
-function wfErrors(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => number[]): number[] {
-  const sorted = [...rows].sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
-  const half = Math.floor(sorted.length / 2);
-  const beta = ols(sorted.slice(0, half).map(f), sorted.slice(0, half).map((p) => ln(p.mcap_usd as number))).beta;
-  return sorted.slice(half).map((p) => ln(p.mcap_usd as number) - f(p).reduce((t, x, j) => t + x * beta[j], 0));
-}
-function flatErrors(rows: SnapshotProtocol[], mode: 'loo' | 'wf'): number[] {
-  if (mode === 'loo') {
-    const out: number[] = [];
-    for (let i = 0; i < rows.length; i++) {
-      const ratios = rows.filter((_, j) => j !== i).map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b);
-      const m = ratios[Math.floor(ratios.length / 2)];
-      out.push(ln(rows[i].mcap_usd as number) - ln(m * rows[i].tvl_usd));
-    }
-    return out;
-  }
-  const sorted = [...rows].sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
-  const half = Math.floor(sorted.length / 2);
-  const ratios = sorted.slice(0, half).map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b);
-  const m = ratios[Math.floor(ratios.length / 2)];
-  return sorted.slice(half).map((p) => ln(p.mcap_usd as number) - ln(m * p.tvl_usd));
-}
-function categoryEffects(rows: SnapshotProtocol[], f: (p: SnapshotProtocol) => number[], beta: number[], shrinkK: number): Record<string, number> {
-  const groups = new Map<string, number[]>();
-  for (const p of rows) {
-    const resid = ln(p.mcap_usd as number) - f(p).reduce((t, x, j) => t + x * beta[j], 0);
-    const key = p.category ?? 'null';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(resid);
-  }
-  const eff: Record<string, number> = {};
-  for (const [key, rs] of groups) {
-    if (rs.length >= 3) eff[key] = median(rs) * (rs.length / (rs.length + shrinkK));
-  }
-  return eff;
-}
-function categoryErrors(rows: SnapshotProtocol[], mode: 'loo' | 'wf'): number[] {
-  const f = valueFeatures;
-  if (mode === 'loo') {
-    const out: number[] = [];
-    for (let i = 0; i < rows.length; i++) {
-      const train = rows.filter((_, j) => j !== i);
-      const beta = ols(train.map(f), train.map((p) => ln(p.mcap_usd as number))).beta;
-      const eff = categoryEffects(train, f, beta, 25);
-      const p = rows[i];
-      out.push(ln(p.mcap_usd as number) - (f(p).reduce((t, x, j) => t + x * beta[j], 0) + (eff[p.category ?? 'null'] ?? 0)));
-    }
-    return out;
-  }
-  const sorted = [...rows].sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
-  const half = Math.floor(sorted.length / 2);
-  const train = sorted.slice(0, half);
-  const beta = ols(train.map(f), train.map((p) => ln(p.mcap_usd as number))).beta;
-  const eff = categoryEffects(train, f, beta, 25);
-  return sorted.slice(half).map((p) => ln(p.mcap_usd as number) - (f(p).reduce((t, x, j) => t + x * beta[j], 0) + (eff[p.category ?? 'null'] ?? 0)));
-}
-function winsorizedLogCaps(rows: SnapshotProtocol[]): number[] {
-  const ys = rows.map((p) => ln(p.mcap_usd as number));
-  const lo = quantile(ys, WINSOR_LO);
-  const hi = quantile(ys, WINSOR_HI);
-  return ys.map((y) => Math.min(hi, Math.max(lo, y)));
-}
-function fitValueCurve(rows: SnapshotProtocol[]): { beta: number[]; eff: Record<string, number> } {
-  const beta = ols(rows.map(valueFeatures), winsorizedLogCaps(rows)).beta;
-  const eff = categoryEffects(rows, valueFeatures, beta, CATEGORY_RIDGE_K);
-  return { beta, eff };
-}
-function valuePrediction(p: SnapshotProtocol, beta: number[], eff: Record<string, number>): number {
-  return valueFeatures(p).reduce((t, x, j) => t + x * beta[j], 0) + (eff[p.category ?? 'null'] ?? 0);
-}
-function comboLooErrors(rows: SnapshotProtocol[]): number[] {
-  const out: number[] = [];
-  for (let i = 0; i < rows.length; i++) {
-    const train = rows.filter((_, j) => j !== i);
-    const { beta, eff } = fitValueCurve(train);
-    out.push(ln(rows[i].mcap_usd as number) - valuePrediction(rows[i], beta, eff));
-  }
-  return out;
-}
-function comboWfErrors(rows: SnapshotProtocol[]): number[] {
-  const sorted = [...rows].sort((a, b) => (a.listed_at as string) < (b.listed_at as string) ? -1 : 1);
-  const half = Math.floor(sorted.length / 2);
-  const { beta, eff } = fitValueCurve(sorted.slice(0, half));
-  return sorted.slice(half).map((p) => ln(p.mcap_usd as number) - valuePrediction(p, beta, eff));
-}
-export function backtestValue(snapshot: Snapshot): ValueBacktest {
-  const comps = valueComps(snapshot);
-  const y = comps.map((p) => ln(p.mcap_usd as number));
-  const { beta, eff } = fitValueCurve(comps);
-  const mean = y.reduce((t, v) => t + v, 0) / y.length;
-  const ssTot = y.reduce((t, v) => t + (v - mean) * (v - mean), 0);
-  const ssRes = comps.reduce((t, p) => {
-    const d = ln(p.mcap_usd as number) - valuePrediction(p, beta, eff);
-    return t + d * d;
-  }, 0);
-  const r2 = 1 - ssRes / ssTot;
-  const loo = looErrors(comps, valueFeatures);
-  const wf = wfErrors(comps, valueFeatures);
-  const comboLoo = comboLooErrors(comps);
-  const comboWf = comboWfErrors(comps);
-  const ev = (term: string, l: number[], w: number[], kept: boolean, note: string): EvidenceRow => ({
-    term, loo: typicalMiss(l), wf: typicalMiss(w), kept, note,
-  });
-  const evidence: EvidenceRow[] = [
-    ev('flat median multiple', flatErrors(comps, 'loo'), flatErrors(comps, 'wf'), false, 'baseline'),
-    ev('size curve, ln TVL', looErrors(comps, (p) => [1, ln(p.tvl_usd)]), wfErrors(comps, (p) => [1, ln(p.tvl_usd)]), true, 'kept'),
-    ev('+ 7-day TVL growth, capped \u00b130%', looErrors(comps, (p) => [1, ln(p.tvl_usd), growthFracCapped(p)]), wfErrors(comps, (p) => [1, ln(p.tvl_usd), growthFracCapped(p)]), true, 'kept: full model with it wins both tests'),
-    ev('+ size bend, (ln TVL \u2212 18)\u00b2', looErrors(comps, valueFeaturesT2), wfErrors(comps, valueFeaturesT2), true, 'kept: lowers both tests'),
-    ev('+ size bend, (ln TVL \u2212 18)\u00b3', loo, wf, true, 'kept: full model with it wins both tests'),
-    ev('+ chain count, ln', looErrors(comps, valueFeaturesChains), wfErrors(comps, valueFeaturesChains), false, 'tested, not kept'),
-    ev('+ no-token age, ln', looErrors(comps, (p) => valueFeaturesAge(p, snapshot.as_of)), wfErrors(comps, (p) => valueFeaturesAge(p, snapshot.as_of)), false, 'tested, not kept'),
-    ev('+ category effect, ridge 25', categoryErrors(comps, 'loo'), categoryErrors(comps, 'wf'), false, 'tested, not kept'),
-    ev('median (LAD) fit, same features', ladLooErrors(comps, valueFeatures), ladWfErrors(comps, valueFeatures), false, 'tested, not kept'),
-    ev('+ winsorized comps, 5\u201395%, and category effect, ridge 50', comboLoo, comboWf, true, 'kept: lowers both tests together'),
-  ];
-  return {
-    beta, eff, r2, loo: comboLoo, wf: comboWf, evidence,
-    flatLoo: typicalMiss(flatErrors(comps, 'loo')),
-    flatWf: typicalMiss(flatErrors(comps, 'wf')),
-  };
-}
-export function ifLaunches(p: SnapshotProtocol, beta: number[], eff: Record<string, number>): number {
-  return Math.exp(valuePrediction(p, beta, eff));
-}
+
 
 // --- Token odds: logistic model on the standing peers ---
 export function oddsPeers(snapshot: Snapshot): SnapshotProtocol[] {
@@ -454,14 +464,17 @@ export function backtestOdds(snapshot: Snapshot): OddsBacktest {
   };
   type ColsFn = (p: SnapshotProtocol, i: number) => number[];
   const sets: { term: string; cols: ColsFn; kept: boolean; note: string }[] = [
-    { term: 'base rate of peers', cols: () => [1], kept: false, note: 'baseline' },
-    { term: '+ size, ln TVL', cols: (p) => [1, sizeCol(p)], kept: true, note: 'kept' },
-    { term: '+ no-token age, ln months', cols: (p) => [1, sizeCol(p), ...ageCols(p)], kept: true, note: 'kept' },
-    { term: '+ 7-day TVL growth', cols: (p) => [1, sizeCol(p), ...ageCols(p), growthFrac(p)], kept: true, note: 'kept' },
-    { term: '+ namesake sibling', cols: (p, i) => oddsFeatures(p, snapshot.as_of, sibs[i]), kept: true, note: 'kept: lowers both tests' },
-    { term: '+ chain count, ln', cols: (p, i) => [...oddsFeatures(p, snapshot.as_of, sibs[i]), ln(Math.max(1, p.chains.length))], kept: false, note: 'tested, not kept' },
+    { term: 'base rate', cols: () => [1], kept: false, note: 'baseline' },
+    { term: '+ size', cols: (p) => [1, sizeCol(p)], kept: true, note: 'kept' },
+    { term: '+ age, ln months', cols: (p) => [1, sizeCol(p), ...ageCols(p)], kept: true, note: 'kept' },
+    { term: '+ growth', cols: (p) => [1, sizeCol(p), ...ageCols(p), growthFrac(p)], kept: true, note: 'kept' },
+    { term: '+ sibling', cols: (p, i) => oddsFeatures(p, snapshot.as_of, sibs[i]), kept: true, note: 'kept: lowers both tests' },
+    { term: '+ chain count', cols: (p, i) => [...oddsFeatures(p, snapshot.as_of, sibs[i]), ln(Math.max(1, p.chains.length))], kept: false, note: 'tested, not kept' },
   ];
-  const evalSet = (cols: ColsFn): { loo: number; wf: number } => {
+  // evalSet returns the predictions as well as the Brier scores, so the
+  // full model's leave-one-out and walk-forward predictions are fitted
+  // once here and reused below instead of refitting the same 436 models.
+  const evalSet = (cols: ColsFn): { loo: number; wf: number; looP: number[]; wfP: number[]; wfY: number[] } => {
     const looP: number[] = [];
     for (let i = 0; i < peers.length; i++) {
       // Train element j is original peer j when j < i, j + 1 when j >= i.
@@ -479,12 +492,10 @@ export function backtestOdds(snapshot: Snapshot): OddsBacktest {
     const beta = fitLogit(trainIdx.map((i) => cols(peers[i], i)), trainIdx.map((i) => y[i]), 1200);
     const wfP = dated.slice(half).map((d) => sigmoid(cols(d.p, d.i).reduce((t, x, j) => t + x * beta[j], 0)));
     const wfY = dated.slice(half).map((d) => y[d.i]);
-    return { loo: brier(looP, y), wf: brier(wfP, wfY) };
+    return { loo: brier(looP, y), wf: brier(wfP, wfY), looP, wfP, wfY };
   };
-  const evidence: EvidenceRow[] = sets.map((s) => {
-    const r = evalSet(s.cols);
-    return { term: s.term, loo: r.loo, wf: r.wf, kept: s.kept, note: s.note };
-  });
+  const evaluated = sets.map((s) => ({ set: s, ...evalSet(s.cols) }));
+  const evidence: EvidenceRow[] = evaluated.map(({ set: s, loo, wf }) => ({ term: s.term, loo, wf, kept: s.kept, note: s.note }));
   // Category-rate variant, computed separately and appended.
   const fitCat = (train: SnapshotProtocol[]): Record<string, number> => {
     const ty = train.map((p) => (isPreToken(p) ? 0 : 1));
@@ -521,40 +532,49 @@ export function backtestOdds(snapshot: Snapshot): OddsBacktest {
   const catWfP = dated.slice(half).map((d) => sigmoid(catCols(d.p, d.i, catEff).reduce((t, x, j) => t + x * catBeta[j], 0)));
   const catWfY = dated.slice(half).map((d) => y[d.i]);
   evidence.push({
-    term: '+ category rate, shrunk',
+    term: '+ category rate',
     loo: brier(catLooP, y),
     wf: brier(catWfP, catWfY),
     kept: false,
     note: 'tested, not kept',
   });
-  // Full model = set 5 (sibling). Recompute LOO predictions at 600 iters
-  // for the accuracy count; WF beta at 1200 iters.
+  // Full model = set 5 (sibling). Its leave-one-out and walk-forward
+  // predictions are the ones evalSet already fitted: reuse them.
   const full = sets[4];
   const beta = fitLogit(peers.map((p, i) => full.cols(p, i)), y, 1200);
   const fullLoo = evidence[4];
-  const looP600: number[] = [];
-  for (let i = 0; i < peers.length; i++) {
-    const tx: number[][] = [];
-    const ty: number[] = [];
-    for (let j = 0; j < peers.length; j++) {
-      if (j === i) continue;
-      tx.push(full.cols(peers[j], j));
-      ty.push(y[j]);
-    }
-    const b = fitLogit(tx, ty, 600);
-    looP600.push(sigmoid(full.cols(peers[i], i).reduce((t, x, j) => t + x * b[j], 0)));
-  }
+  const looP600 = evaluated[4].looP;
   const looAcc = looP600.filter((pr, i) => (pr >= 0.5 ? 1 : 0) === y[i]).length / y.length;
-  const wfBeta = fitLogit(catTrainIdx.map((i) => full.cols(peers[i], i)), catTrainIdx.map((i) => y[i]), 1200);
-  const wfP = dated.slice(half).map((d) => sigmoid(full.cols(d.p, d.i).reduce((t, x, j) => t + x * wfBeta[j], 0)));
-  const wfY = dated.slice(half).map((d) => y[d.i]);
+  const wfP = evaluated[4].wfP;
+  const wfY = evaluated[4].wfY;
   const wfAcc = wfP.filter((pr, i) => (pr >= 0.5 ? 1 : 0) === wfY[i]).length / wfY.length;
   // In-sample accuracy, same 0.5 call, labelled as such wherever printed:
   // it is the fit describing its own training peers, not held-out proof.
   const insampleAcc = peers.filter((p, i) => (sigmoid(full.cols(p, i).reduce((t, x, j) => t + x * beta[j], 0)) >= 0.5 ? 1 : 0) === y[i]).length / y.length;
+  // Precision on the confident subsets (held-out, never in-sample): the
+  // low side calls a peer unlikely (odds <= 10%) and counts how many
+  // recorded no token; the high side calls a peer likely (>= 70%).
+  const precLow = (preds: number[], ys: number[]): { prec: number; n: number } => {
+    const sub = preds.map((pr, i) => ({ pr, y: ys[i] })).filter((r) => r.pr <= 0.1);
+    return { prec: sub.length > 0 ? sub.filter((r) => r.y === 0).length / sub.length : 0, n: sub.length };
+  };
+  const precHigh = (preds: number[], ys: number[]): { prec: number; n: number } => {
+    const sub = preds.map((pr, i) => ({ pr, y: ys[i] })).filter((r) => r.pr >= 0.7);
+    return { prec: sub.length > 0 ? sub.filter((r) => r.y === 1).length / sub.length : 0, n: sub.length };
+  };
+  const conf = (preds: number[], ys: number[]): { acc: number; n: number } => {
+    const sub = preds.map((pr, i) => ({ pr, y: ys[i] })).filter((r) => r.pr >= 0.9 || r.pr <= 0.1);
+    return { acc: sub.length > 0 ? sub.filter((r) => (r.pr >= 0.5 ? 1 : 0) === r.y).length / sub.length : 0, n: sub.length };
+  };
+  const plLoo = precLow(looP600, y);
+  const plWf = precLow(wfP, wfY);
+  const phWf = precHigh(wfP, wfY);
+  const cfWf = conf(wfP, wfY);
   return {
     beta, baseRate, loo: fullLoo.loo, wf: fullLoo.wf, looAcc, wfAcc, insampleAcc,
     baseLoo: evidence[0].loo, baseWf: evidence[0].wf, evidence,
+    precLowLoo: plLoo.prec, precLowNLoo: plLoo.n, precLowWf: plWf.prec, precLowNWf: plWf.n,
+    precHighWf: phWf.prec, precHighNWf: phWf.n, confAccWf: cfWf.acc, confNWf: cfWf.n,
   };
 }
 export function tokenOdds(p: SnapshotProtocol, snapshot: Snapshot, beta: number[]): number {
@@ -621,6 +641,29 @@ export function stepText(step: FarmStep): string {
   if (s.length < 20) s += ' Hold the position and check the protocol\u2019s own page.';
   return s;
 }
+function riskFor(p: SnapshotProtocol, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Read ${name}'s borrow rates and liquidation rules on ${chain} first: a sharp price move can liquidate a leveraged position, so keep the loan-to-value below half the limit.`;
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Read ${name}'s pool page on ${chain} first: the pool can lose value while the token price moves, so check the pair's range before you add liquidity.`;
+  if (c.includes('bridge')) return `Read ${name}'s bridge limits on ${chain} first: a bridge can pause withdrawals, so never send more than you can leave locked for the full window.`;
+  if (c.includes('staking') || c.includes('restak')) return `Read ${name}'s unbonding rules on ${chain} first: staked funds can take days to release, so do not stake money you need before the window ends.`;
+  if (c.includes('perpetual') || c.includes('derivative')) return `Read ${name}'s funding and liquidation rules on ${chain} first: a small hedge can still be liquidated in a fast move, so keep the position small.`;
+  if (c.includes('prediction')) return `Read ${name}'s market rules on ${chain} first: a prediction market can resolve against you, so treat the stake as the cost of the signal, not as savings.`;
+  if (c.includes('curator') || c.includes('allocator')) return `Read the vault's strategy page on ${chain} first: a vault stacks other protocols beneath it, so any one of them failing can take the position with it.`;
+  if (c.includes('stable')) return `Read how ${name}'s stable asset holds its peg on ${chain} first: a depeg cuts the deposit itself, so check the reserves page before you mint.`;
+  if (c.includes('rwa')) return `Read what backs ${name}'s yield asset on ${chain} first: the yield depends on off-chain assets, so check the issuer's reports before you mint.`;
+  return `Read ${name}'s own docs on ${chain} first: a smart-contract bug or a paused withdrawal can trap the deposit, so check the audit and pause history before you commit.`;
+}
+function moneyShort(n: number): string {
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
+  return `$${n.toFixed(0)}`;
+}
+// Ten steps, specific to this protocol: its chain, its category action,
+// its gas, its TVL exit floor and its own numbers. No step is shared
+// word-for-word with another row except the wallet and ledger hygiene.
 export function farmSteps(p: SnapshotProtocol, scenario: FarmScenario, econ: Econ): FarmStep[] {
   const capital = capitalFor(p);
   const chain = chainOf(p);
@@ -628,13 +671,24 @@ export function farmSteps(p: SnapshotProtocol, scenario: FarmScenario, econ: Eco
   const action = actionFor(p, capital, chain);
   const weeks = scenario.horizon_weeks;
   const weeklyGas = gas * weeks;
+  const floor = Math.round(p.tvl_usd * 0.83);
+  const second = p.chains.length > 1 ? p.chains[1] : null;
+  const deepen = second !== null
+    ? `Hold the receipt ${p.name} gives you and use it once on ${second}; activity on a second chain counts as a separate signal, and the same wallet ties it together.`
+    : `Leave the receipt ${p.name} gives you in the same wallet for the full ${weeks} weeks; moving it to another wallet splits the activity across two addresses.`;
+  const net = econ.net_of_fees_usd;
+  const netTxt = net >= 0 ? `$${net.toFixed(0)}` : `-$${Math.abs(net).toFixed(0)}`;
   return [
     { text: `Use a fresh wallet that holds only the funds you plan to farm, fund it with $${scenario.deposit_usd.toLocaleString()} of USDC on ${chain}, and keep its seed phrase offline.`, cost: `about $${gas.toFixed(2)} gas`, time: '5 min' },
+    { text: `Open ${p.name}'s own site from its DefiLlama page and match the contract address on ${chain} before you approve anything; never sign a link sent in a message.`, cost: '$0', time: '10 min' },
     { text: action, cost: `$${capital} + $${gas.toFixed(2)} gas`, time: '15 min' },
+    { text: riskFor(p, chain), cost: '$0', time: '10 min' },
     { text: `Make one qualifying action each week for ${weeks} weeks, such as a deposit, a borrow, a swap or a vote, so the activity spans the whole window.`, cost: `about $${weeklyGas.toFixed(2)} gas`, time: '15 min/wk' },
-    { text: `Hold the position for the full ${weeks} weeks so the activity is counted in more than one snapshot.`, cost: `$${capital} locked`, time: `${weeks} wk` },
+    { text: deepen, cost: `about $${gas.toFixed(2)} gas`, time: '10 min' },
+    { text: `Withdraw if ${p.name}'s TVL prints below ${moneyShort(floor)} (\u221217% from today's ${moneyShort(p.tvl_usd)}) or if withdrawals pause; below that floor the modelled drop no longer covers the fees at this deposit.`, cost: '$0', time: '5 min/wk' },
     { text: `Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes. Never pay to claim.`, cost: `about $${gas.toFixed(2)} gas`, time: '15 min' },
-    { text: `Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it.`, cost: '$0', time: '5 min' },
+    { text: `Write the wallet, the dates and every transaction hash in a farm log so you can repeat the position or unwind it.`, cost: '$0', time: '5 min' },
+    { text: `At the end of ${weeks} weeks, close the position and compare: the same $${scenario.deposit_usd.toLocaleString()} in a 4% T-bill pays $${econ.tbill_usd.toFixed(0)}, while this farm nets ${netTxt} after fees, about $${econ.net_per_hour_usd.toFixed(0)} an hour for ${econ.hours.toFixed(1)} hours of work.`, cost: `about $${gas.toFixed(2)} gas`, time: '15 min' },
   ];
 }
 
@@ -798,11 +852,14 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
       brier_wf: r3(odds.wf), brier_base_wf: r3(odds.baseWf), brier_loo: r3(odds.loo),
       odds_acc_wf: r3(odds.wfAcc), odds_acc_loo: r3(odds.looAcc),
       odds_acc_insample: r3(odds.insampleAcc),
+      odds_prec_low_wf: r3(odds.precLowWf), odds_prec_low_n_wf: odds.precLowNWf,
+      odds_prec_low_loo: r3(odds.precLowLoo), odds_prec_low_n_loo: odds.precLowNLoo,
+      odds_prec_high_wf: r3(odds.precHighWf), odds_prec_high_n_wf: odds.precHighNWf,
       value_kept: value.evidence.filter((e) => e.kept).length,
       value_tested: value.evidence.filter((e) => e.note !== 'baseline').length,
       odds_kept: odds.evidence.filter((e) => e.kept).length,
       odds_tested: odds.evidence.filter((e) => e.note !== 'baseline').length,
-      worth_farming: verdicts.ROBUST ?? 0, skip_count: verdicts.SKIP ?? 0, verdicts,
+      worth_farming: (verdicts.ROBUST ?? 0) + (verdicts.FARM ?? 0), skip_count: verdicts.SKIP ?? 0, verdicts,
     },
     accounting: accounting(snapshot, board),
     rows: board.map((r) => radarRow(r, watch.has(r.slug))),
